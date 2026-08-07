@@ -1,0 +1,4 @@
+interface:
+  display_name: "Consult Garcon"
+  short_description: "Consult agents through visible Garcon chats"
+  default_prompt: "Use $consult-garcon to consult an agent or delegate work through a visible Garcon chat."
