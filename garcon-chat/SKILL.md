@@ -1,6 +1,6 @@
 ---
 name: garcon-chat
-description: Send asynchronous, steer-capable messages between existing Garcon agents by chat ID.
+description: Communicate with Garcon agents by chat ID.
 ---
 
 # Garcon Chat
@@ -31,16 +31,10 @@ If this fails, stop and inform the user. Never assume an installed `garcon-cli` 
 Prefix every outbound message exactly as follows:
 
 ```text
-[garcon-chat from <CALLING_CHAT_ID> to <CALLING_CHAT_ID>] <message>
+[garcon-chat: <CALLING_CHAT_ID> to <TARGET_CHAT_ID>] <message>
 ```
 
-Also include this routing instruction the first time and periodically afterwards to inform the receiving agent:
-
-```text
-Reply using the `garcon-chat` skill. Use `<TARGET_CHAT_ID>` as your calling agent chat ID and `<CALLING_CHAT_ID>` as the target agent chat ID.
-```
-
-Keep the caller-provided content intact between the standardized prefix and routing instruction. Put multiline or substantial messages in a uniquely named temporary Markdown file.
+Put multiline or substantial messages in a uniquely named temporary Markdown file.
 
 ## Send Asynchronously
 

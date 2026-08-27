@@ -1,4 +1,4 @@
 interface:
   display_name: "Garcon Chat"
-  short_description: "Message another Garcon agent chat asynchronously"
+  short_description: "Communicate with Garcon agents by chat ID."
   default_prompt: "Use $garcon-chat to send a message from my Garcon chat to another agent chat."
