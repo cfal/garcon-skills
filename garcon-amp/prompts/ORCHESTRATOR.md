@@ -7,7 +7,7 @@ Use this packet with `SKILL.md`. It adds resolved paths and operational details 
     Garcon chat ID: {{CHAT_ID}}
     state directory: {{STATE_PATH}}
     generated instruction file: {{INSTRUCTIONS_PATH}}
-    Garcon repository root: {{GARCON_PATH}}
+    Garcon CLI working directory: {{GARCON_PATH}}
     shared sandbox: {{SANDBOX_PATH}}
     oracle: {{ORACLE_PATH}}
     finder: {{FINDER_PATH}}

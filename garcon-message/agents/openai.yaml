@@ -1,4 +1,4 @@
 interface:
   display_name: "Garcon Message"
   short_description: "Send in-band messages between Garcon agent chats"
-  default_prompt: "Use $garcon-msg to send an in-band message to another Garcon agent chat."
+  default_prompt: "Use $garcon-message to send an in-band message to another Garcon agent chat."

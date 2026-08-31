@@ -34,10 +34,12 @@ describe('Garcon message skill protocol', () => {
     expect(skill).not.toContain('CALLING_CHAT_ID');
   });
 
-  test('renames the skill and its live-review consumer', () => {
-    expect(metadata).toContain('$garcon-msg');
+  test('uses the garcon-message name in metadata and consumers', () => {
+    expect(metadata).toContain('$garcon-message');
+    expect(metadata).not.toContain('$garcon-msg');
     expect(metadata).not.toContain('$garcon-chat');
-    expect(adversarial).toContain('a `garcon-msg` live review');
+    expect(adversarial).toContain('a `garcon-message` live review');
+    expect(adversarial).not.toContain('`garcon-msg`');
     expect(adversarial).not.toContain('`garcon-chat`');
     expect(adversarial).not.toContain("If you don't know your own chat ID");
   });

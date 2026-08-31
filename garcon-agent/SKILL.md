@@ -7,7 +7,25 @@ description: Direct an agent through an already-running Garcon server. Use for a
 
 ## Workflow
 
-Use `bun /garcon/cli/main` as the agent execution path. Verify the CLI works with `bun /garcon/cli/main --version`. If this fails, stop and inform the user.
+Resolve the CLI in this order: `garcon-cli` on `PATH`, `$HOME/garcon`, then `/garcon`.
+
+```bash
+GARCON_CLI=()
+if garcon_cli_path=$(command -v garcon-cli 2>/dev/null); then
+  GARCON_CLI=("$garcon_cli_path")
+else
+  for garcon_root in "$HOME/garcon" /garcon; do
+    for garcon_entry in "$garcon_root/cli/main" "$garcon_root/cli/main.ts"; do
+      if [[ -f "$garcon_entry" ]]; then
+        GARCON_CLI=(bun "$garcon_entry")
+        break 2
+      fi
+    done
+  done
+fi
+```
+
+If the array remains empty, stop and ask the user for the Garcon repository path, then use its first existing `cli/main` or `cli/main.ts` through `bun`. Otherwise verify with `"${GARCON_CLI[@]}" --version`; stop and tell the user if verification fails. Use the resolved array in each shell invocation below, repeating the block in later shell invocations when needed.
 
 User inputs:
 
@@ -34,11 +52,11 @@ Omit `--workspace` if `WORKSPACE` is unset or set to `default`.
 The output can be long, so use `grep -i` to filter on values provided by the user.
 
 ```bash
-bun /garcon/cli/main --workspace "$WORKSPACE" list providers --agent "$AGENT" --json
-bun /garcon/cli/main --workspace "$WORKSPACE" list endpoints --agent "$AGENT" --provider "$PROVIDER" --json
-bun /garcon/cli/main --workspace "$WORKSPACE" list models --agent "$AGENT" --provider "$PROVIDER" --json
-bun /garcon/cli/main --workspace "$WORKSPACE" list permissions --agent "$AGENT" --json
-bun /garcon/cli/main --workspace "$WORKSPACE" list reasoning-efforts --agent "$AGENT" --json
+"${GARCON_CLI[@]}" --workspace "$WORKSPACE" list providers --agent "$AGENT" --json
+"${GARCON_CLI[@]}" --workspace "$WORKSPACE" list endpoints --agent "$AGENT" --provider "$PROVIDER" --json
+"${GARCON_CLI[@]}" --workspace "$WORKSPACE" list models --agent "$AGENT" --provider "$PROVIDER" --json
+"${GARCON_CLI[@]}" --workspace "$WORKSPACE" list permissions --agent "$AGENT" --json
+"${GARCON_CLI[@]}" --workspace "$WORKSPACE" list reasoning-efforts --agent "$AGENT" --json
 ```
 
 Discover in dependency order: agent, provider, endpoint when applicable, then model. A provider is optional when the model is unambiguous; omit its filter in that case.
@@ -73,7 +91,7 @@ Point at files the consultant can read directly; do not copy repository contents
 Use only flags with actual values:
 
 ```bash
-bun /garcon/cli/main \
+"${GARCON_CLI[@]}" \
   --workspace "$WORKSPACE" \
   --cwd "$TARGET_DIR" \
   --agent "$AGENT" \
@@ -99,7 +117,7 @@ Do not impose an artificial timeout. Keep the CLI attached while the agent works
 Resume follow-up work on the same topic and agent instead of starting over:
 
 ```bash
-bun /garcon/cli/main \
+"${GARCON_CLI[@]}" \
   --workspace "$WORKSPACE" \
   --resume "$CHAT_ID" \
   - < "$FOLLOW_UP_PROMPT_FILE"

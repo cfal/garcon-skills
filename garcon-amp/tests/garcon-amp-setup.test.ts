@@ -754,7 +754,8 @@ describe('garcon-amp setup', () => {
     expect(result.stdout).toContain('--librarian <agent-spec>');
     expect(result.stdout).toContain('--reporter <agent-spec>');
     expect(result.stdout).toContain('--garcon-path <dir>');
-    expect(result.stdout).toContain('an omitted --garcon-path searches /garcon, then $HOME/garcon');
+    expect(result.stdout).toContain('an omitted --garcon-path uses garcon-cli on PATH');
+    expect(result.stdout).toContain('$HOME/garcon, then /garcon');
     expect(result.stdout).toContain('Absolute sandbox shared by the parent and specialists');
     expect(result.stdout).toContain('existing selection is tightened to 0700');
     expect(result.stdout).not.toContain('--show-full-request');
@@ -771,6 +772,66 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     expect(result.stdout).toContain('creates this file with the bundled defaults when it is missing');
     expect(result.stdout).toContain('The notice shows the complete current role config when it changed');
     expect(result.stdout).toContain('says No changes');
+  });
+
+  test('uses and preserves garcon-cli on PATH while an explicit root overrides it', async () => {
+    const directBinPath = await createBin(agentNames);
+    const directCliPath = path.join(directBinPath, 'garcon-cli');
+    const directHomePath = path.join(fixturePath, 'direct-cli-home');
+    await mkdir(directHomePath);
+    await writeFile(directCliPath, mockGarconCli, { mode: 0o700 });
+    const discovered = newChatId();
+    const directEnvironment = { HOME: directHomePath };
+    const directRunOptions = { binPath: directBinPath, env: directEnvironment };
+
+    const first = await run([setupPath, discovered.chatId], directRunOptions);
+    expect(first.exitCode).toBe(0);
+    expect(await installation(discovered.statePath)).toEqual({
+      schemaVersion: 1,
+      garconPath: directBinPath,
+      garconCliExecutable: directCliPath,
+      sandboxPath: path.join(discovered.statePath, 'sandbox'),
+    });
+
+    const finder = path.join(discovered.statePath, 'finder');
+    expect((await run([finder, 'Use the direct CLI.'], directRunOptions)).exitCode).toBe(0);
+    const started = await run(
+      [finder, '--start', 'Use the direct callback.'],
+      directRunOptions,
+    );
+    expect(started.exitCode).toBe(0);
+    await waitForRunEnd(discovered.statePath, 'finder');
+    const reporter = path.join(discovered.statePath, 'reporter');
+    expect((await run(
+      [reporter, 'Use the supplied Garcon CLI command.'],
+      directRunOptions,
+    )).exitCode).toBe(0);
+    expect((await calls()).at(-1).prompt).toContain(
+      `Garcon CLI command: '${directCliPath}'`,
+    );
+    const directRows = await allRowCalls();
+    expect(directRows).toHaveLength(7);
+    expect(directRows.every((row) => row.cliPath === directCliPath)).toBe(true);
+
+    await writeFile(rowLogPath, '');
+    expect((await run([setupPath, discovered.chatId], { env: directEnvironment })).exitCode).toBe(0);
+    expect((await setupNoticeRows())[0].cliPath).toBe(directCliPath);
+
+    await writeFile(rowLogPath, '');
+    const explicit = newChatId();
+    const explicitResult = await run([
+      setupPath,
+      explicit.chatId,
+      '--garcon-path',
+      garconPath,
+    ], directRunOptions);
+    expect(explicitResult.exitCode).toBe(0);
+    expect(await installation(explicit.statePath)).toEqual({
+      schemaVersion: 1,
+      garconPath,
+      sandboxPath: path.join(explicit.statePath, 'sandbox'),
+    });
+    expect((await setupNoticeRows())[0].cliPath).toBe(path.join(garconPath, 'cli', 'main.ts'));
   });
 
   test('loads bundled role defaults from the packaged defaults file', async () => {
@@ -2086,14 +2147,16 @@ describe('generated adapters', () => {
       expect(call.cwd.startsWith(`${sandboxPath}/.garcon-amp-reporter.`)).toBe(true);
       expect(call.prompt.startsWith('# Reporter\n')).toBe(true);
       expect(call.prompt).toContain('## Current request from the orchestrator');
-      expect(call.prompt).toContain(`Garcon CLI path: ${path.join(garconPath, 'cli', 'main.ts')}`);
+      expect(call.prompt).toContain('Garcon CLI command: bun ');
       expect(call.prompt).toContain(`Transcript query path: ${path.join(skillPath, 'transcript-query')}`);
       expect(call.env.transcriptQueryPath).toBe(path.join(skillPath, 'transcript-query'));
       expect(call.prompt).toContain(`Private working directory (removed when this run ends): ${call.cwd}`);
       expect(call.prompt).not.toContain('Shared sandbox directory:');
       expect(call.prompt).toContain(`Goal:\n${goal}`);
-      expect(call.prompt).toContain('bun <cli> handoff <chat-id> --context-window-size <tokens>');
-      expect(call.prompt).toContain('bun <cli> export <chat-id> --format xml');
+      expect(call.prompt).toContain(
+        '<garcon-cli-command> handoff <chat-id> --context-window-size <tokens>',
+      );
+      expect(call.prompt).toContain('<garcon-cli-command> export <chat-id> --format xml');
       expect(call.prompt).toContain(nativeTranscript);
       expectExactlyOnce(call.prompt, reporterInvocationInvariants);
       expect(await pathExists(call.cwd)).toBe(false);
@@ -2247,7 +2310,9 @@ describe('generated adapters', () => {
 
     expect(reporterPrompt).toContain("call only Garcon's read-only `handoff` and `export` commands");
     expect(reporterPrompt).toContain('For comprehensive whole-chat goals, begin with a handoff artifact');
-    expect(reporterPrompt).toContain('bun <cli> handoff <chat-id> --context-window-size <tokens>');
+    expect(reporterPrompt).toContain(
+      '<garcon-cli-command> handoff <chat-id> --context-window-size <tokens>',
+    );
     expect(reporterPrompt).toContain('--output <work-dir>/<source>-handoff.xml');
     expect(reporterPrompt).toContain('`--context-window-size` accepts an integer token count');
     expect(reporterPrompt).toContain('normally no more than half of a known model context window');

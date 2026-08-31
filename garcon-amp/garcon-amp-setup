@@ -20,9 +20,10 @@ import {
 } from './lib/agent-config.ts';
 import {
   defaultGarconRootCandidates,
-  discoverGarconRoot,
+  discoverGarconCli,
   findGarconCliPath,
-  MISSING_GARCON_ROOT_MESSAGE,
+  MISSING_GARCON_CLI_MESSAGE,
+  resolveGarconCliExecutable,
 } from './lib/garcon-path.ts';
 
 const skillPath = path.dirname(fileURLToPath(import.meta.url));
@@ -47,8 +48,9 @@ const roleDefinitions = {
 
 const usage = `Usage: ./garcon-amp-setup <garcon-chat-id> [--garcon-path <garcon-repo-root>] [options]
 
-On first setup, an omitted --garcon-path searches /garcon, then $HOME/garcon.
-Reruns preserve the recorded Garcon root, role selections, and shared sandbox.
+On first setup, an omitted --garcon-path uses garcon-cli on PATH, then searches
+$HOME/garcon, then /garcon. Reruns preserve the recorded CLI source, role
+selections, and shared sandbox.
 Every consultation publishes its complete request in a collapsed, user-visible Garcon transcript row.
 Exclude secrets not authorized for Garcon transcript visibility.
 
@@ -338,6 +340,8 @@ async function readExistingInstallation(filePath) {
     installation?.schemaVersion !== 1
     || typeof installation.garconPath !== 'string'
     || typeof installation.sandboxPath !== 'string'
+    || (installation.garconCliExecutable !== undefined
+      && typeof installation.garconCliExecutable !== 'string')
   ) {
     fail(`invalid installation record schema: ${filePath}`);
   }
@@ -345,13 +349,20 @@ async function readExistingInstallation(filePath) {
   return installation;
 }
 
-async function publishSetupNotice(garconCliPath, garconPath, chatId, title, content) {
+function garconCliCommand(garconCli, ...args) {
+  const command = garconCli.garconCliRunner === 'bun'
+    ? ['bun', garconCli.garconCliPath]
+    : [garconCli.garconCliPath];
+  return [...command, ...args];
+}
+
+async function publishSetupNotice(garconCli, chatId, title, content) {
   const child = Bun.spawn({
-    cmd: [
-      'bun', garconCliPath, 'add-row', chatId,
+    cmd: garconCliCommand(
+      garconCli, 'add-row', chatId,
       '--type', 'notice', '--title', title, '-',
-    ],
-    cwd: garconPath,
+    ),
+    cwd: garconCli.garconPath,
     env: process.env,
     stdin: 'pipe',
     stdout: 'ignore',
@@ -450,8 +461,15 @@ function renderInstructions(template, values) {
   return packet;
 }
 
-function installationFor(garconPath, sandboxPath) {
-  return { schemaVersion: 1, garconPath, sandboxPath };
+function installationFor(garconCli, sandboxPath) {
+  return {
+    schemaVersion: 1,
+    garconPath: garconCli.garconPath,
+    sandboxPath,
+    ...(garconCli.garconCliRunner === 'direct'
+      ? { garconCliExecutable: garconCli.garconCliPath }
+      : {}),
+  };
 }
 
 async function resolveSharedSandbox(directory, recovery) {
@@ -510,6 +528,9 @@ const existingRoleConfig = await readActiveRoleConfig(activeConfigPath);
 const existingInstallation = await readExistingInstallation(installationPath);
 
 const selectedGarconPath = requestedGarconPath ?? existingInstallation?.garconPath;
+const selectedGarconCliExecutable = requestedGarconPath === undefined
+  ? existingInstallation?.garconCliExecutable
+  : undefined;
 
 const roles = ROLE_NAMES.map((name) => {
   let config;
@@ -527,24 +548,34 @@ const roles = ROLE_NAMES.map((name) => {
   return { name, ...roleDefinitions[name], config };
 });
 
-let garconPath;
-let garconCliPath;
-if (selectedGarconPath === undefined) {
-  const discovered = await discoverGarconRoot(defaultGarconRootCandidates(userRoleDefaults.home));
-  if (discovered === undefined) fail(MISSING_GARCON_ROOT_MESSAGE);
-  ({ garconPath, garconCliPath } = discovered);
+let garconCli;
+if (selectedGarconCliExecutable !== undefined) {
+  const resolved = await resolveGarconCliExecutable(selectedGarconCliExecutable);
+  if (resolved === undefined) {
+    fail(`recorded Garcon CLI executable is unavailable: ${selectedGarconCliExecutable}`);
+  }
+  garconCli = resolved;
+} else if (selectedGarconPath === undefined) {
+  garconCli = await discoverGarconCli(
+    Bun.which('garcon-cli') ?? undefined,
+    defaultGarconRootCandidates(userRoleDefaults.home),
+  );
+  if (garconCli === undefined) fail(MISSING_GARCON_CLI_MESSAGE);
 } else {
+  let garconPath;
   try {
     garconPath = await realpath(selectedGarconPath);
     if (!(await stat(garconPath)).isDirectory()) throw new Error('not a directory');
   } catch {
     fail(`Garcon repository root is not an existing directory: ${selectedGarconPath}`);
   }
-  garconCliPath = await findGarconCliPath(garconPath);
+  const garconCliPath = await findGarconCliPath(garconPath);
   if (garconCliPath === undefined) {
     fail(`Garcon repository root has no cli/main or cli/main.ts: ${garconPath}`);
   }
+  garconCli = { garconPath, garconCliPath, garconCliRunner: 'bun' };
 }
+const { garconPath, garconCliPath, garconCliRunner } = garconCli;
 
 const defaultSandboxPath = path.join(statePath, 'sandbox');
 const storedSandboxPath = requestedSharedSandbox === undefined && !resetDefaults
@@ -604,6 +635,10 @@ const generatedRoles = roles.map((role) => {
     __CHAT_ID__: chatId,
     __GARCON_PATH__: garconPath,
     __GARCON_CLI_PATH__: garconCliPath,
+    __GARCON_CLI_RUNNER__: garconCliRunner,
+    __GARCON_CLI_COMMAND__: garconCliRunner === 'bun'
+      ? `bun ${shellQuote(garconCliPath)}`
+      : shellQuote(garconCliPath),
     __TRANSCRIPT_QUERY_PATH__: transcriptQueryPath,
     __TRANSCRIPT_XML_PATH__: transcriptXmlPath,
     __STATE_PATH__: statePath,
@@ -648,7 +683,7 @@ const generatedArtifacts = generatedRoles.flatMap((role) => [
 ]);
 const installationArtifact = {
   target: installationPath,
-  data: `${JSON.stringify(installationFor(garconPath, sandboxPath), null, 2)}\n`,
+  data: `${JSON.stringify(installationFor(garconCli, sandboxPath), null, 2)}\n`,
   mode: 0o600,
   kind: 'installation record',
 };
@@ -684,8 +719,7 @@ if (userRoleDefaults.shouldCreate) {
   createdRoleDefaultsIdentity = await createBundledRoleDefaults(userRoleDefaults.path);
 }
 const noticeStatus = await publishSetupNotice(
-  garconCliPath,
-  garconPath,
+  garconCli,
   chatId,
   setupNoticeTitle,
   setupNoticeContent,

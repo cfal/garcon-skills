@@ -19,9 +19,9 @@ function exportedString(source: string, name: string): string {
 }
 
 describe('skill activation protocol', () => {
-  test('keeps chat-ID discovery exact, single-shot, and fail-closed', () => {
+  test('keeps chat-ID discovery edge-bound, single-shot, and fail-closed', () => {
     const discoveryStart = skill.indexOf('Setup needs a verified 16-digit Garcon chat ID');
-    const discoveryEnd = skill.indexOf('`--garcon-path` is optional.');
+    const discoveryEnd = skill.indexOf('`--garcon-path` is optional');
     const discovery = skill.slice(discoveryStart, discoveryEnd);
 
     expect(discoveryStart).toBeGreaterThan(-1);
@@ -29,13 +29,15 @@ describe('skill activation protocol', () => {
     expect(skill.split(requestMarker)).toHaveLength(2);
     for (const requiredPhrase of [
       disclosureEnvelope,
-      'as the entire assistant text message',
-      'never in reasoning',
-      'surrounding whitespace, prose, or formatting',
-      'then end the turn',
+      'physical beginning or end of an assistant message',
+      'must touch that edge',
+      'Other assistant content may appear only on the other side',
+      'the turn may continue',
+      'Never place it in reasoning',
       'at most once across',
       'direct control continuation',
-      'Do not call a tool, delay, or poll',
+      'Do not delay or poll',
+      'continue only setup-independent work',
       'starts one direct control run',
       "provider's optional steering preamble",
       "this skill's intact packet from a successful setup call",
@@ -43,14 +45,20 @@ describe('skill activation protocol', () => {
     ]) {
       expect(discovery).toContain(requiredPhrase);
     }
-    for (const obsoletePhrase of ['two seconds', 'tool boundary']) {
+    for (const obsoletePhrase of [
+      'as the entire assistant text message',
+      'then end the turn',
+      'Do not call a tool',
+      'two seconds',
+      'tool boundary',
+    ]) {
       expect(discovery).not.toContain(obsoletePhrase);
     }
     expect(new TextEncoder().encode(discovery).byteLength).toBeLessThanOrEqual(1_400);
 
-    const disclosureIndex = discovery.indexOf('The fresh disclosure for this activation is authoritative');
+    const disclosureIndex = discovery.indexOf('A fresh disclosure is authoritative');
     const userIndex = discovery.indexOf('an explicit current-chat user ID');
-    const packetIndex = discovery.indexOf('then the trusted packet');
+    const packetIndex = discovery.indexOf("then this skill's intact packet");
     expect(disclosureIndex).toBeGreaterThan(-1);
     expect(userIndex).toBeGreaterThan(disclosureIndex);
     expect(packetIndex).toBeGreaterThan(userIndex);
@@ -60,6 +68,18 @@ describe('skill activation protocol', () => {
     expect(skill).not.toContain('when the current Garcon chat ID has been provided');
     expect(openAiMetadata).toContain('Discover and validate the current Garcon chat ID');
     expect(openAiMetadata).not.toContain('with the current Garcon chat ID');
+  });
+
+  test('documents PATH-first Garcon CLI discovery', () => {
+    const pathIndex = skill.indexOf('uses `garcon-cli` on `PATH`');
+    const homeIndex = skill.indexOf('`$HOME/garcon`', pathIndex);
+    const rootIndex = skill.indexOf('then `/garcon`', homeIndex);
+    const askIndex = skill.indexOf('stop and ask the user for the Garcon path', rootIndex);
+
+    expect(pathIndex).toBeGreaterThan(-1);
+    expect(homeIndex).toBeGreaterThan(pathIndex);
+    expect(rootIndex).toBeGreaterThan(homeIndex);
+    expect(askIndex).toBeGreaterThan(rootIndex);
   });
 
   test('matches installed Garcon protocol constants when available', async () => {

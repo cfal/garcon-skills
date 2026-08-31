@@ -5,6 +5,12 @@ ROLE=__ROLE__
 CHAT_ID=__CHAT_ID__
 GARCON_PATH=__GARCON_PATH__
 GARCON_CLI_PATH=__GARCON_CLI_PATH__
+GARCON_CLI_RUNNER=__GARCON_CLI_RUNNER__
+GARCON_CLI_COMMAND=__GARCON_CLI_COMMAND__
+GARCON_CLI_ARGV=("$GARCON_CLI_PATH")
+if [[ "$GARCON_CLI_RUNNER" == bun ]]; then
+  GARCON_CLI_ARGV=(bun "$GARCON_CLI_PATH")
+fi
 TRANSCRIPT_QUERY_PATH=__TRANSCRIPT_QUERY_PATH__
 TRANSCRIPT_XML_PATH=__TRANSCRIPT_XML_PATH__
 if [[ "$ROLE" == reporter ]]; then
@@ -601,7 +607,7 @@ send_callback() {
   fi
   callback_title="$(title_with_spec "$callback_title")"
   callback_command=(
-    bun "$GARCON_CLI_PATH" send-async "$CHAT_ID"
+    "${GARCON_CLI_ARGV[@]}" send-async "$CHAT_ID"
     --allow-steer
     --message-title "$callback_title"
     "${callback_presentation[@]}"
@@ -864,7 +870,7 @@ print_file_with_newline() {
 add_transcript_rows() {
   local title=$1 content_file=$2
   bun -e '
-const [cliPath, chatId, title, contentPath, garconPath, role, accent] = Bun.argv.slice(1);
+const [cliRunner, cliPath, chatId, title, contentPath, garconPath, role, accent] = Bun.argv.slice(1);
 const maximumRowBytes = 64 * 1024;
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const useMarkdown = Bun.file(contentPath).size <= maximumRowBytes;
@@ -876,7 +882,8 @@ async function appendRow(content) {
     console.error(`${role}: cannot publish a whitespace-only transcript row`);
     process.exit(1);
   }
-  const command = ["bun", cliPath, "add-row", chatId, "--color", accent, "--title", title];
+  const command = cliRunner === "bun" ? ["bun", cliPath] : [cliPath];
+  command.push("add-row", chatId, "--color", accent, "--title", title);
   if (useMarkdown) command.push("--markdown");
   command.push("--collapsible", "-");
   const child = Bun.spawn({
@@ -927,7 +934,7 @@ try {
   console.error(`${role}: failed to publish ${title}: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 }
-' "$GARCON_CLI_PATH" "$CHAT_ID" "$title" "$content_file" "$GARCON_PATH" "$ROLE" "$ROLE_ACCENT"
+' "$GARCON_CLI_RUNNER" "$GARCON_CLI_PATH" "$CHAT_ID" "$title" "$content_file" "$GARCON_PATH" "$ROLE" "$ROLE_ACCENT"
 }
 
 request_title="$ROLE_ACTIVITY_TITLE request"
@@ -941,18 +948,18 @@ if [[ "$ROLE" == reporter ]]; then
   printf -v invocation_prompt '## Current request from the orchestrator
 
 Private working directory (removed when this run ends): %s
-Garcon CLI path: %s
+Garcon CLI command: %s
 Transcript query path: %s
 
 Treat this request as self-contained. The parent/orchestrator owns the user task, decisions, implementation, final verification, and user communication. Use only sources and source locators supplied in the goal. Put transient files only in the private working directory and leave them there for launcher cleanup. Do not modify any source transcript, repository, Git state, or Garcon chat. Do not delegate or ask questions. Return one complete result.
 
 Goal:
 %s' \
-    "$WORK_PATH" "$GARCON_CLI_PATH" "$TRANSCRIPT_QUERY_PATH" "$user_prompt"
+    "$WORK_PATH" "$GARCON_CLI_COMMAND" "$TRANSCRIPT_QUERY_PATH" "$user_prompt"
 else
   printf -v invocation_prompt '## Current request from the orchestrator
 
-Initial working directory (Garcon repository root): %s
+Initial working directory: %s
 Shared sandbox directory: %s
 
 Treat this request as self-contained. The parent/orchestrator owns the user task, all intended changes to the target repository, integration, final verification, and user communication.
