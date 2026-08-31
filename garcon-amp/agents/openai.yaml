@@ -1,0 +1,6 @@
+interface:
+  display_name: "Garcon-Amp"
+  short_description: "Oracle, Finder, Librarian, and Reporter specialists"
+  default_prompt: "Use $garcon-amp. Discover and validate the current Garcon chat ID, run or rehydrate setup, read its complete marked runtime supplement, then autonomously consult Oracle, Finder, Librarian, and Reporter when useful; keep implementation in the parent and use Oracle --review for completed-diff review."
+policy:
+  allow_implicit_invocation: true

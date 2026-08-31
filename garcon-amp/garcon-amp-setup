@@ -1,0 +1,708 @@
+#!/usr/bin/env bun
+
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
+import {
+  canonicalAgentSpec,
+  parseAgentSpec,
+  ROLE_NAMES,
+} from './lib/agent-config.ts';
+import {
+  defaultGarconRootCandidates,
+  discoverGarconRoot,
+  findGarconCliPath,
+  MISSING_GARCON_ROOT_MESSAGE,
+} from './lib/garcon-path.ts';
+
+const skillPath = path.dirname(fileURLToPath(import.meta.url));
+const bundledRoleDefaultsPath = path.join(skillPath, 'defaults.conf');
+const bundledRoleDefaultsSource = await requireBundledFile(
+  bundledRoleDefaultsPath,
+  'role defaults file',
+);
+const bundledRoleDefaults = parseRoleAssignments(
+  bundledRoleDefaultsSource,
+  bundledRoleDefaultsPath,
+  { requireAll: true, kind: 'bundled role default' },
+);
+const bundledRoleDefaultsContent = renderRoleAssignments(bundledRoleDefaults);
+
+const roleDefinitions = {
+  oracle: { prompt: 'ORACLE.md', title: 'Oracle', accent: '0891b2,22d3ee' },
+  finder: { prompt: 'FINDER.md', title: 'Finder', accent: '065f46,34d399' },
+  librarian: { prompt: 'LIBRARIAN.md', title: 'Librarian', accent: 'b45309,fbbf24' },
+  reporter: { prompt: 'REPORTER.md', title: 'Reporter', accent: '7c3aed,c4b5fd' },
+};
+
+const usage = `Usage: ./garcon-amp-setup <garcon-chat-id> [--garcon-path <garcon-repo-root>] [options]
+
+On first setup, an omitted --garcon-path searches /garcon, then $HOME/garcon.
+Reruns preserve the recorded Garcon root, role selections, and shared sandbox.
+Every consultation publishes its complete request in a collapsed, user-visible Garcon transcript row.
+Exclude secrets not authorized for Garcon transcript visibility.
+
+Options:
+  --garcon-path <dir>     Explicit Garcon repository root containing cli/main
+                           or cli/main.ts (optional; overrides discovery)
+  --shared-sandbox <dir>  Absolute sandbox shared by the parent and specialists
+                           (created recursively when missing)
+                           (existing selection is tightened to 0700)
+                           (first-run default: /tmp/garcon-amp-<chat-id>/sandbox)
+  --reset-defaults        Reset roles to configured defaults and reset sandbox
+                           before explicit overrides
+
+Role options:
+  --oracle <agent-spec>
+  --finder <agent-spec>
+  --librarian <agent-spec>
+  --reporter <agent-spec>
+
+Agent specs:
+  codex:<model>:<effort>
+  claude:<model>:<effort>
+  pi:<provider>:<model>:<effort>
+  opencode:<provider>:<model>:<variant>
+
+Use default as the effort or variant to omit the native level flag.
+
+Bundled defaults (defaults.conf):
+  oracle=${bundledRoleDefaults.oracle}
+  finder=${bundledRoleDefaults.finder}
+  librarian=${bundledRoleDefaults.librarian}
+  reporter=${bundledRoleDefaults.reporter}
+
+User role-default file:
+  $HOME/.config/garcon-amp.conf
+
+Setup creates this file with the bundled defaults when it is missing. Each
+nonblank line is <specialist-role>=<agent-spec>. Explicit role options override
+file defaults. Established role selections remain preserved until explicitly
+changed or reapplied with --reset-defaults.
+
+Every successful rerun validates the installation, publishes a re-initialized
+notice in the selected chat, and reprints its complete runtime instruction packet.
+The notice shows the complete current role config when it changed; otherwise it
+says No changes.`;
+
+const instructionsFileName = 'INSTRUCTIONS.md';
+const instructionsBeginMarker = 'GARCON-AMP INSTRUCTIONS BEGIN';
+const instructionsEndMarker = 'GARCON-AMP INSTRUCTIONS END';
+const instructionsMaxBytes = 12 * 1024;
+const activeConfigFileName = 'garcon-amp.conf';
+const installationFileName = '.installation.json';
+const initializationNoticeTitle = 'Garcon-Amp initialized';
+const reinitializationNoticeTitle = 'Garcon-Amp re-initialized';
+const roleDefaultsCreationNotice = 'Created $HOME/.config/garcon-amp.conf with defaults';
+const noRoleChangesNotice = 'No changes';
+
+function fail(message) {
+  console.error(`garcon-amp-setup: ${message}`);
+  process.exit(2);
+}
+
+function shellQuote(value) {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function parseRoleAssignments(content, filePath, { requireAll = false, kind = 'role default' } = {}) {
+  const specs = {};
+  const seen = new Set();
+  for (const [index, rawLine] of content.split('\n').entries()) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (!line.trim()) continue;
+    const separator = line.indexOf('=');
+    if (separator <= 0 || separator === line.length - 1) {
+      fail(`invalid ${kind} at ${filePath}:${index + 1}; expected <specialist-role>=<spec>`);
+    }
+    const name = line.slice(0, separator);
+    const spec = line.slice(separator + 1);
+    if (!ROLE_NAMES.includes(name)) {
+      fail(`unknown specialist role in ${kind} at ${filePath}:${index + 1}: ${name}`);
+    }
+    if (seen.has(name)) fail(`duplicate ${name} ${kind} at ${filePath}:${index + 1}`);
+    seen.add(name);
+    let parsed;
+    try {
+      parsed = parseAgentSpec(spec);
+    } catch (error) {
+      fail(`invalid ${name} ${kind} at ${filePath}:${index + 1}: ${error.message}`);
+    }
+    specs[name] = canonicalAgentSpec(parsed);
+  }
+  if (requireAll) {
+    for (const role of ROLE_NAMES) {
+      if (specs[role] === undefined) fail(`${kind} is missing ${role}: ${filePath}`);
+    }
+  }
+  return specs;
+}
+
+async function readUserRoleDefaults() {
+  const home = process.env.HOME;
+  if (!home) fail('HOME is not set; cannot resolve role defaults file');
+  const defaultsPath = path.join(home, '.config', 'garcon-amp.conf');
+  const info = await requireOwnedRegularFileIfPresent(defaultsPath, 'role defaults file');
+  if (!info) return { specs: {}, path: defaultsPath, shouldCreate: true, home };
+  let content;
+  try {
+    content = await readFile(defaultsPath, 'utf8');
+  } catch (error) {
+    fail(`cannot read role defaults file: ${defaultsPath}: ${error.message}`);
+  }
+  return {
+    specs: parseRoleAssignments(content, defaultsPath),
+    path: defaultsPath,
+    shouldCreate: false,
+    home,
+  };
+}
+
+async function createBundledRoleDefaults(defaultsPath) {
+  try {
+    await mkdir(path.dirname(defaultsPath), { recursive: true, mode: 0o700 });
+  } catch (error) {
+    fail(`cannot create role defaults directory: ${path.dirname(defaultsPath)}: ${error.message}`);
+  }
+  try {
+    await writeFile(defaultsPath, bundledRoleDefaultsContent, {
+      encoding: 'utf8',
+      mode: 0o600,
+      flag: 'wx',
+    });
+  } catch (error) {
+    if (error?.code === 'EEXIST') {
+      fail(`role defaults file appeared during setup; rerun to use it: ${defaultsPath}`);
+    }
+    fail(`cannot create role defaults file: ${defaultsPath}: ${error.message}`);
+  }
+  return lstat(defaultsPath);
+}
+
+async function rollbackCreatedRoleDefaults(defaultsPath, identity) {
+  const current = await lstatIfPresent(defaultsPath);
+  if (
+    current
+    && !current.isSymbolicLink()
+    && current.isFile()
+    && current.dev === identity.dev
+    && current.ino === identity.ino
+  ) {
+    await rm(defaultsPath);
+  }
+}
+
+function renderRoleAssignments(specs) {
+  return `${ROLE_NAMES.map((name) => `${name}=${specs[name]}`).join('\n')}\n`;
+}
+
+function renderRoleConfig(roles) {
+  return renderRoleAssignments(Object.fromEntries(
+    roles.map((role) => [role.name, canonicalAgentSpec(role.config)]),
+  ));
+}
+
+async function readActiveRoleConfig(filePath) {
+  const info = await requireOwnedRegularFileIfPresent(filePath, 'active role config');
+  if (!info) return undefined;
+  let content;
+  try {
+    content = await readFile(filePath, 'utf8');
+  } catch (error) {
+    fail(`cannot read active role config: ${filePath}: ${error.message}`);
+  }
+  const specs = parseRoleAssignments(content, filePath, {
+    requireAll: true,
+    kind: 'active role config',
+  });
+  if ((info.mode & 0o777) !== 0o600) await chmod(filePath, 0o600);
+  return { specs };
+}
+
+async function lstatIfPresent(filePath) {
+  try {
+    return await lstat(filePath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+async function readBundledFile(filePath, kind) {
+  try {
+    return await readFile(filePath, 'utf8');
+  } catch (error) {
+    fail(`cannot read bundled ${kind}: ${filePath}: ${error.message}`);
+  }
+}
+
+async function requireBundledFile(filePath, kind, { executable = false } = {}) {
+  let info;
+  try {
+    info = await lstat(filePath);
+  } catch (error) {
+    fail(`cannot inspect bundled ${kind}: ${filePath}: ${error.message}`);
+  }
+  if (info.isSymbolicLink() || !info.isFile()) fail(`refusing unsafe bundled ${kind}: ${filePath}`);
+  if (executable && (info.mode & 0o111) === 0) {
+    fail(`bundled ${kind} is not executable: ${filePath}`);
+  }
+  return readBundledFile(filePath, kind);
+}
+
+async function requireOwnedRegularFileIfPresent(filePath, kind) {
+  const info = await lstatIfPresent(filePath);
+  if (!info) return undefined;
+  if (info.isSymbolicLink() || !info.isFile()) fail(`refusing unsafe ${kind}: ${filePath}`);
+  if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
+    fail(`${kind} is owned by another user: ${filePath}`);
+  }
+  return info;
+}
+
+async function inspectPrivateDirectory(directory) {
+  const existing = await lstatIfPresent(directory);
+  if (existing) {
+    if (existing.isSymbolicLink() || !existing.isDirectory()) {
+      fail(`refusing unsafe existing state path: ${directory}`);
+    }
+    if (typeof process.getuid === 'function' && existing.uid !== process.getuid()) {
+      fail(`existing state directory is owned by another user: ${directory}`);
+    }
+  }
+  return existing;
+}
+
+async function ensurePrivateDirectory(directory) {
+  const existing = await inspectPrivateDirectory(directory);
+  if (!existing) await mkdir(directory, { mode: 0o700 });
+  await chmod(directory, 0o700);
+}
+
+async function atomicWrite(target, data, mode) {
+  const temporary = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.${process.pid}.${crypto.randomUUID()}.tmp`,
+  );
+  await writeFile(temporary, data, { encoding: 'utf8', mode, flag: 'wx' });
+  try {
+    await rename(temporary, target);
+    await chmod(target, mode);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
+}
+
+async function atomicWriteIfChanged(target, data, mode, kind) {
+  const info = await lstatIfPresent(target);
+  if (info) {
+    if (info.isSymbolicLink() || !info.isFile()) fail(`refusing unsafe ${kind}: ${target}`);
+    if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
+      fail(`${kind} is owned by another user: ${target}`);
+    }
+    let existingData;
+    try {
+      existingData = await readFile(target, 'utf8');
+    } catch {
+      existingData = undefined;
+    }
+    if (existingData === data) {
+      if ((info.mode & 0o777) !== mode) await chmod(target, mode);
+      return;
+    }
+  }
+  await atomicWrite(target, data, mode);
+}
+
+async function readExistingInstallation(filePath) {
+  const info = await requireOwnedRegularFileIfPresent(filePath, 'installation record');
+  if (!info) return undefined;
+  let installation;
+  try {
+    installation = JSON.parse(await readFile(filePath, 'utf8'));
+  } catch {
+    fail(`invalid installation record JSON: ${filePath}`);
+  }
+  if (
+    installation?.schemaVersion !== 1
+    || typeof installation.garconPath !== 'string'
+    || typeof installation.sandboxPath !== 'string'
+  ) {
+    fail(`invalid installation record schema: ${filePath}`);
+  }
+  if ((info.mode & 0o777) !== 0o600) await chmod(filePath, 0o600);
+  return installation;
+}
+
+async function publishSetupNotice(garconCliPath, garconPath, chatId, title, content) {
+  const child = Bun.spawn({
+    cmd: [
+      'bun', garconCliPath, 'add-row', chatId,
+      '--type', 'notice', '--title', title, '-',
+    ],
+    cwd: garconPath,
+    env: process.env,
+    stdin: 'pipe',
+    stdout: 'ignore',
+    stderr: 'inherit',
+  });
+  child.stdin.write(content);
+  child.stdin.end();
+  return child.exited;
+}
+
+function parseOptions(args) {
+  if (args.length === 1 && (args[0] === '--help' || args[0] === '-h')) {
+    console.log(usage);
+    process.exit(0);
+  }
+  if (args.length === 0 || args[0].startsWith('-')) fail(usage);
+
+  const chatId = args[0];
+  const seen = new Set();
+  const roleSpecs = {};
+  let requestedGarconPath;
+  let requestedSharedSandbox;
+  let resetDefaults = false;
+
+  for (let index = 1; index < args.length;) {
+    const option = args[index];
+    if (!option?.startsWith('--')) fail(usage);
+    if (seen.has(option)) fail(`duplicate option: ${option}`);
+    seen.add(option);
+
+    if (option === '--reset-defaults') {
+      resetDefaults = true;
+      index += 1;
+      continue;
+    }
+
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith('--')) fail(usage);
+
+    if (option === '--garcon-path') {
+      requestedGarconPath = value;
+      index += 2;
+      continue;
+    }
+
+    if (option === '--shared-sandbox') {
+      requestedSharedSandbox = value;
+      index += 2;
+      continue;
+    }
+
+    const role = option.slice(2);
+    if (!ROLE_NAMES.includes(role)) fail(`unknown option: ${option}`);
+    roleSpecs[role] = value;
+    index += 2;
+  }
+
+  return {
+    chatId,
+    requestedGarconPath,
+    requestedSharedSandbox,
+    roleSpecs,
+    resetDefaults,
+  };
+}
+
+function assertInstructionValue(kind, value) {
+  if (/\p{Cc}/u.test(value)) fail(`${kind} contains a control character and cannot be printed safely`);
+  if (/[\p{Cf}\u2028\u2029]/u.test(value)) {
+    fail(`${kind} contains a formatting character and cannot be printed safely`);
+  }
+  if (value.includes(instructionsBeginMarker) || value.includes(instructionsEndMarker)) {
+    fail(`${kind} contains an instruction packet marker and cannot be printed safely`);
+  }
+}
+
+function renderInstructions(template, values) {
+  if (template.includes(instructionsBeginMarker) || template.includes(instructionsEndMarker)) {
+    fail('runtime instruction template contains an instruction packet marker');
+  }
+  const placeholderFreeTemplate = template.replace(/\{\{[A-Z_]+\}\}/g, '');
+  if (placeholderFreeTemplate.includes('{{') || placeholderFreeTemplate.includes('}}')) {
+    fail('unresolved runtime instruction placeholder');
+  }
+  const body = template.replace(/\{\{([A-Z_]+)\}\}/g, (placeholder, name) => {
+    const value = values[name];
+    if (value === undefined) fail(`unknown runtime instruction placeholder: ${placeholder}`);
+    assertInstructionValue(`runtime instruction value ${name}`, value);
+    return value;
+  });
+  const packet = `${instructionsBeginMarker}\n${body.trimEnd()}\n${instructionsEndMarker}\n`;
+  const byteLength = new TextEncoder().encode(packet).byteLength;
+  if (byteLength > instructionsMaxBytes) {
+    fail(`runtime instruction packet is ${byteLength} bytes; maximum is ${instructionsMaxBytes}`);
+  }
+  return packet;
+}
+
+function installationFor(garconPath, sandboxPath) {
+  return { schemaVersion: 1, garconPath, sandboxPath };
+}
+
+async function resolveSharedSandbox(directory, recovery) {
+  try {
+    const resolved = await realpath(directory);
+    if (!(await stat(resolved)).isDirectory()) throw new Error('not a directory');
+    return resolved;
+  } catch {
+    fail(`shared sandbox is not an existing directory: ${directory}; ${recovery}`);
+  }
+}
+
+function openCodeConfig(agentName, role) {
+  return JSON.stringify({
+    share: 'disabled',
+    subagent_depth: 0,
+    agent: {
+      [agentName]: {
+        description: `Garcon-Amp ${role} specialist`,
+        mode: 'primary',
+        permission: {
+          '*': 'deny',
+          read: 'allow',
+          edit: 'allow',
+          bash: 'allow',
+          glob: 'allow',
+          grep: 'allow',
+          list: 'allow',
+          external_directory: 'allow',
+          task: 'deny',
+          question: 'deny',
+          plan_enter: 'deny',
+          plan_exit: 'deny',
+        },
+      },
+    },
+  });
+}
+
+const {
+  chatId,
+  requestedGarconPath,
+  requestedSharedSandbox,
+  roleSpecs,
+  resetDefaults,
+} = parseOptions(Bun.argv.slice(2));
+if (!/^\d{16}$/.test(chatId)) fail('Garcon chat ID must contain exactly 16 digits');
+const userRoleDefaults = await readUserRoleDefaults();
+
+const statePath = path.join('/tmp', `garcon-amp-${chatId}`);
+const existingState = await inspectPrivateDirectory(statePath);
+if (existingState) await chmod(statePath, 0o700);
+const activeConfigPath = path.join(statePath, activeConfigFileName);
+const installationPath = path.join(statePath, installationFileName);
+const existingRoleConfig = await readActiveRoleConfig(activeConfigPath);
+const existingInstallation = await readExistingInstallation(installationPath);
+
+const selectedGarconPath = requestedGarconPath ?? existingInstallation?.garconPath;
+
+const roles = ROLE_NAMES.map((name) => {
+  let config;
+  try {
+    const spec = roleSpecs[name]
+      ?? (resetDefaults
+        ? undefined
+        : existingRoleConfig?.specs[name])
+      ?? userRoleDefaults.specs[name]
+      ?? bundledRoleDefaults[name];
+    config = parseAgentSpec(spec);
+  } catch (error) {
+    fail(`invalid ${name} agent spec: ${error.message}`);
+  }
+  return { name, ...roleDefinitions[name], config };
+});
+
+let garconPath;
+let garconCliPath;
+if (selectedGarconPath === undefined) {
+  const discovered = await discoverGarconRoot(defaultGarconRootCandidates(userRoleDefaults.home));
+  if (discovered === undefined) fail(MISSING_GARCON_ROOT_MESSAGE);
+  ({ garconPath, garconCliPath } = discovered);
+} else {
+  try {
+    garconPath = await realpath(selectedGarconPath);
+    if (!(await stat(garconPath)).isDirectory()) throw new Error('not a directory');
+  } catch {
+    fail(`Garcon repository root is not an existing directory: ${selectedGarconPath}`);
+  }
+  garconCliPath = await findGarconCliPath(garconPath);
+  if (garconCliPath === undefined) {
+    fail(`Garcon repository root has no cli/main or cli/main.ts: ${garconPath}`);
+  }
+}
+
+const defaultSandboxPath = path.join(statePath, 'sandbox');
+const storedSandboxPath = requestedSharedSandbox === undefined && !resetDefaults
+  ? existingInstallation?.sandboxPath
+  : undefined;
+const selectedSandboxPath = requestedSharedSandbox
+  ?? storedSandboxPath
+  ?? defaultSandboxPath;
+if (requestedSharedSandbox !== undefined && !path.isAbsolute(requestedSharedSandbox)) {
+  fail(`shared sandbox must be an absolute directory path: ${requestedSharedSandbox}`);
+}
+let sandboxPath = selectedSandboxPath;
+if (requestedSharedSandbox === undefined && selectedSandboxPath !== defaultSandboxPath) {
+  sandboxPath = await resolveSharedSandbox(
+    selectedSandboxPath,
+    'recreate it, pass --shared-sandbox <absolute-directory> to create or select one, or use --reset-defaults',
+  );
+}
+
+for (const binary of new Set(['bun', 'setsid', ...roles.map((role) => role.config.agent)])) {
+  if (!Bun.which(binary)) fail(`required selected executable is not on PATH: ${binary}`);
+}
+
+const transcriptQueryPath = path.join(skillPath, 'transcript-query');
+const transcriptXmlPath = path.join(skillPath, 'lib', 'transcript-xml.ts');
+await requireBundledFile(transcriptQueryPath, 'transcript query tool', { executable: true });
+await requireBundledFile(transcriptXmlPath, 'transcript query library');
+const template = await readBundledFile(
+  path.join(skillPath, 'assets', 'role-launcher.sh'),
+  'launcher template',
+);
+const instructionsTemplate = await readBundledFile(
+  path.join(skillPath, 'prompts', 'ORCHESTRATOR.md'),
+  'runtime instruction template',
+);
+
+if (requestedSharedSandbox !== undefined) {
+  assertInstructionValue('shared sandbox path', selectedSandboxPath);
+  try {
+    await mkdir(selectedSandboxPath, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    fail(`cannot create shared sandbox: ${selectedSandboxPath}: ${error.message}`);
+  }
+  sandboxPath = await resolveSharedSandbox(
+    selectedSandboxPath,
+    'the explicit path could not be resolved after its creation check; check path access and retry',
+  );
+}
+
+await ensurePrivateDirectory(statePath);
+await ensurePrivateDirectory(sandboxPath);
+
+const generatedRoles = roles.map((role) => {
+  const openCodeAgentName = `garcon-amp-${chatId}-${role.name}`;
+  const replacements = {
+    __ROLE__: role.name,
+    __CHAT_ID__: chatId,
+    __GARCON_PATH__: garconPath,
+    __GARCON_CLI_PATH__: garconCliPath,
+    __TRANSCRIPT_QUERY_PATH__: transcriptQueryPath,
+    __TRANSCRIPT_XML_PATH__: transcriptXmlPath,
+    __STATE_PATH__: statePath,
+    __SANDBOX_PATH__: sandboxPath,
+    __ROLE_TITLE__: role.title,
+    __ROLE_ACCENT__: role.accent,
+    __ROLE_PROMPT_PATH__: path.join(skillPath, 'prompts', role.prompt),
+    __REVIEW_PROMPT_PATH__: path.join(skillPath, 'prompts', 'REVIEW.md'),
+    __OPENCODE_AGENT_NAME__: openCodeAgentName,
+    __OPENCODE_CONFIG_JSON__: openCodeConfig(openCodeAgentName, role.name),
+  };
+  const launcher = template.replace(/__[A-Z_]+__/g, (placeholder) => {
+    const value = replacements[placeholder];
+    if (value === undefined) fail(`unknown launcher template placeholder: ${placeholder}`);
+    return shellQuote(value);
+  });
+  if (/__[A-Z_]+__/.test(launcher)) fail(`unresolved launcher template placeholder for ${role.name}`);
+
+  return { ...role, launcher };
+});
+
+const instructionsPath = path.join(statePath, instructionsFileName);
+const instructionPacket = renderInstructions(instructionsTemplate, {
+  CHAT_ID: chatId,
+  STATE_PATH: statePath,
+  INSTRUCTIONS_PATH: instructionsPath,
+  GARCON_PATH: garconPath,
+  SANDBOX_PATH: sandboxPath,
+  ORACLE_PATH: path.join(statePath, 'oracle'),
+  FINDER_PATH: path.join(statePath, 'finder'),
+  LIBRARIAN_PATH: path.join(statePath, 'librarian'),
+  REPORTER_PATH: path.join(statePath, 'reporter'),
+});
+
+const generatedArtifacts = generatedRoles.flatMap((role) => [
+  {
+    target: path.join(statePath, role.name),
+    data: role.launcher,
+    mode: 0o700,
+    kind: 'generated role launcher',
+  },
+]);
+const installationArtifact = {
+  target: installationPath,
+  data: `${JSON.stringify(installationFor(garconPath, sandboxPath), null, 2)}\n`,
+  mode: 0o600,
+  kind: 'installation record',
+};
+generatedArtifacts.push({
+  target: instructionsPath,
+  data: instructionPacket,
+  mode: 0o600,
+  kind: 'generated instruction file',
+});
+
+const activeRoleConfig = renderRoleConfig(roles);
+const roleConfigChanged = existingRoleConfig === undefined
+  || activeRoleConfig !== renderRoleAssignments(existingRoleConfig.specs);
+const setupNoticeTitle = existingRoleConfig === undefined
+  ? initializationNoticeTitle
+  : reinitializationNoticeTitle;
+const setupNoticeConfig = roleConfigChanged ? activeRoleConfig : `${noRoleChangesNotice}\n`;
+const setupNoticeContent = userRoleDefaults.shouldCreate
+  ? `${setupNoticeConfig}\n${roleDefaultsCreationNotice}\n`
+  : setupNoticeConfig;
+
+for (const artifact of generatedArtifacts) {
+  await atomicWriteIfChanged(
+    artifact.target,
+    artifact.data,
+    artifact.mode,
+    artifact.kind,
+  );
+}
+
+let createdRoleDefaultsIdentity;
+if (userRoleDefaults.shouldCreate) {
+  createdRoleDefaultsIdentity = await createBundledRoleDefaults(userRoleDefaults.path);
+}
+const noticeStatus = await publishSetupNotice(
+  garconCliPath,
+  garconPath,
+  chatId,
+  setupNoticeTitle,
+  setupNoticeContent,
+);
+if (noticeStatus !== 0) {
+  if (createdRoleDefaultsIdentity) {
+    await rollbackCreatedRoleDefaults(userRoleDefaults.path, createdRoleDefaultsIdentity);
+  }
+  fail(
+    `could not publish ${setupNoticeTitle} notice; active role config was not changed (exit ${noticeStatus})`,
+  );
+}
+await atomicWriteIfChanged(
+  installationArtifact.target,
+  installationArtifact.data,
+  installationArtifact.mode,
+  installationArtifact.kind,
+);
+await atomicWriteIfChanged(activeConfigPath, activeRoleConfig, 0o600, 'active role config');
+process.stdout.write(instructionPacket);

@@ -1,0 +1,923 @@
+#!/usr/bin/env bun
+
+import path from 'node:path';
+import { lstat, readFile } from 'node:fs/promises';
+import {
+  GarconXmlDocumentError,
+  GarconXmlInputError,
+  scanCanonicalGarconXml,
+  type GarconXmlArea,
+  type GarconXmlDocument,
+  type GarconXmlEntry,
+  type GarconXmlVisitor,
+} from './lib/transcript-xml.ts';
+
+const MAX_ROWS = 10_000;
+const MAX_SNIPPET = 4_000;
+const MAX_LITERAL = 16_384;
+const MAX_SHOW_CHARACTERS = 50_000;
+const MAX_DRAFT_BYTES = 10 * 1024 * 1024;
+const MAX_BUFFERED_ROWS = 10_000;
+const MAX_CELL_CHARACTERS = 8_000;
+const MAX_OUTPUT_BYTES = 64 * 1024;
+const MAX_ATTRIBUTES_PER_ROW = 100;
+const OUTPUT_ENCODER = new TextEncoder();
+const CITATION_CANDIDATE_PATTERN = /\[[^\]\r\n]*#[0-9]+[^\]\r\n]*\]/g;
+const CITATION_PATTERN = /^\[(?:(\d{16})#|#)([1-9][0-9]*)(?:-#([1-9][0-9]*))?\]$/;
+
+const help = `Usage: transcript-query <command> <absolute-xml-path> [options]
+
+Commands:
+  doc       Document metadata, coverage, ordinal bounds, and gaps
+  entries   Chronological entry openings and handoff gaps
+  search    Literal search with owning ordinals and bounded snippets
+  show      Bounded decoded content for exact ordinals or an ordinal range
+  tool-id   Calls and results with one exact decoded tool ID
+  audit     Verify explicit ordinals or citation endpoints from a draft
+
+Run transcript-query <command> --help for command options.
+
+Only canonical Garcon transcript-export version=1 and handoff-artifact
+version=1 XML are accepted. Output is tab-separated and never contains
+physical file line numbers. --ignore-case folds ASCII letters only. Output is
+hard-capped at 64 KiB and reports when rows were suppressed.`;
+
+const commandHelp: Record<string, string> = {
+  doc: `Usage: transcript-query doc <absolute-xml-path>`,
+  entries: `Usage: transcript-query entries <absolute-xml-path> [--from N] [--to N]
+       [--kind tag[,tag...]] [--limit N]`,
+  search: `Usage: transcript-query search <absolute-xml-path> --literal <text>
+       [--where any|text|field|field:<name>|attribute|attribute:<name>]
+       [--ignore-case] [--snippet N] [--limit N] [--max-per-entry N]`,
+  show: `Usage: transcript-query show <absolute-xml-path>
+       (--ordinal N[,N...] | --range A-B)...
+       [--part all|text|attributes|field|field:<name>]
+       [--offset N] [--max-chars N] [--max-lines N] [--limit N]`,
+  'tool-id': `Usage: transcript-query tool-id <absolute-xml-path> --id <decoded-id>
+       [--max-chars N] [--max-lines N] [--limit N]`,
+  audit: `Usage: transcript-query audit <absolute-xml-path>
+       (--ordinal N[,N...] | --draft <absolute-markdown-path>)...`,
+};
+
+class UsageError extends Error {}
+
+class BoundedRows {
+  readonly values: string[] = [];
+  truncated = false;
+  private bytes = 0;
+
+  get length(): number {
+    return this.values.length;
+  }
+
+  push(value: string): boolean {
+    if (this.truncated) return false;
+    const bytes = OUTPUT_ENCODER.encode(value).byteLength + 1;
+    if (
+      this.values.length >= MAX_BUFFERED_ROWS
+      || this.bytes + bytes > MAX_OUTPUT_BYTES
+    ) {
+      this.truncated = true;
+      return false;
+    }
+    this.values.push(value);
+    this.bytes += bytes;
+    return true;
+  }
+
+  finish(summary: string): string[] {
+    return [...this.values, summary];
+  }
+}
+
+interface CommandResult {
+  readonly rows: readonly string[];
+  readonly missing?: boolean;
+}
+
+interface SearchMatch {
+  readonly entry: GarconXmlEntry;
+  readonly area: GarconXmlArea;
+  readonly snippet: string;
+  readonly clipped: boolean;
+}
+
+interface PendingMatch {
+  readonly prefix: string;
+  readonly prefixClipped: boolean;
+  suffix: string;
+  remaining: number;
+}
+
+class StreamingLiteralMatcher {
+  private history = '';
+  private pending: PendingMatch[] = [];
+  private consumed = 0;
+  private readonly needle: string;
+
+  constructor(
+    literal: string,
+    private readonly ignoreCase: boolean,
+    private readonly context: number,
+    private readonly onMatch: (snippet: string, clipped: boolean) => void,
+  ) {
+    this.needle = ignoreCase ? foldAscii(literal) : literal;
+  }
+
+  push(text: string): void {
+    if (text === '') return;
+    this.feedPending(text);
+    const previousHistory = this.history;
+    const window = previousHistory + text;
+    const searched = this.ignoreCase ? foldAscii(window) : window;
+    let from = Math.max(0, previousHistory.length - this.needle.length + 1);
+    for (;;) {
+      const at = searched.indexOf(this.needle, from);
+      if (at < 0) break;
+      const absoluteAt = this.consumed - previousHistory.length + at;
+      const end = at + this.needle.length;
+      const suffix = window.slice(end, end + this.context);
+      const match: PendingMatch = {
+        prefix: window.slice(Math.max(0, at - this.context), end),
+        prefixClipped: absoluteAt > this.context,
+        suffix,
+        remaining: this.context - suffix.length,
+      };
+      if (window.length - end > this.context) this.emit(match, true);
+      else this.pending.push(match);
+      from = at + 1;
+    }
+    const historySize = this.context + Math.max(0, this.needle.length - 1);
+    this.history = window.slice(Math.max(0, window.length - historySize));
+    this.consumed += text.length;
+  }
+
+  finish(): void {
+    for (const match of this.pending) this.emit(match, false);
+    this.pending = [];
+  }
+
+  private feedPending(text: string): void {
+    if (this.pending.length === 0) return;
+    const remaining: PendingMatch[] = [];
+    for (const match of this.pending) {
+      if (match.remaining === 0) {
+        this.emit(match, true);
+        continue;
+      }
+      const suffix = text.slice(0, match.remaining);
+      match.suffix += suffix;
+      match.remaining -= suffix.length;
+      if (match.remaining === 0 && text.length > suffix.length) this.emit(match, true);
+      else remaining.push(match);
+    }
+    this.pending = remaining;
+  }
+
+  private emit(match: PendingMatch, suffixClipped: boolean): void {
+    this.onMatch(
+      `${match.prefixClipped ? '…' : ''}${match.prefix}${match.suffix}${suffixClipped ? '…' : ''}`,
+      match.prefixClipped || suffixClipped,
+    );
+  }
+}
+
+class PartCapture {
+  private offsetRemaining: number;
+  private characters = 0;
+  private lines = 1;
+  private output = '';
+  private clipped = false;
+
+  constructor(
+    offset: number,
+    private readonly maximumCharacters: number,
+    private readonly maximumLines: number,
+  ) {
+    this.offsetRemaining = offset;
+  }
+
+  push(text: string): void {
+    for (const character of text) {
+      if (this.offsetRemaining > 0) {
+        this.offsetRemaining -= 1;
+        continue;
+      }
+      if (this.characters >= this.maximumCharacters) {
+        this.clipped = true;
+        return;
+      }
+      if (character === '\n' && this.lines >= this.maximumLines) {
+        this.clipped = true;
+        return;
+      }
+      this.output += character;
+      this.characters += 1;
+      if (character === '\n') this.lines += 1;
+    }
+  }
+
+  finish(): { readonly text: string; readonly clipped: boolean } {
+    if (this.offsetRemaining > 0) this.clipped = true;
+    return { text: this.output, clipped: this.clipped };
+  }
+}
+
+async function run(args: string[]): Promise<CommandResult> {
+  const [command, ...rest] = args;
+  if (command === undefined || command === '--help' || command === '-h') {
+    return { rows: [help] };
+  }
+  if (!(command in commandHelp)) throw new UsageError(`unknown command: ${command}`);
+  if (rest[0] === '--help' || rest[0] === '-h') return { rows: [commandHelp[command]] };
+  const filePath = rest.shift();
+  if (filePath === undefined) throw new UsageError(commandHelp[command]);
+  switch (command) {
+    case 'doc': return runDoc(filePath, rest);
+    case 'entries': return runEntries(filePath, rest);
+    case 'search': return runSearch(filePath, rest);
+    case 'show': return runShow(filePath, rest);
+    case 'tool-id': return runToolId(filePath, rest);
+    case 'audit': return runAudit(filePath, rest);
+    default: throw new UsageError(`unknown command: ${command}`);
+  }
+}
+
+async function runDoc(filePath: string, args: string[]): Promise<CommandResult> {
+  requireNoArguments(args, commandHelp.doc);
+  const document = await scanCanonicalGarconXml(filePath);
+  const rows = new BoundedRows();
+  rows.push(row('document', document.kind, ...attributeCells(document.rootAttributes)));
+  for (const metadata of document.metadata) {
+    rows.push(row(metadata.tag, ...attributeCells(metadata.attributes)));
+  }
+  const gapLimit = Math.min(document.gaps.length, 200);
+  for (const gap of document.gaps.slice(0, gapLimit)) rows.push(gapRow(gap));
+  return {
+    rows: rows.finish(summaryRow(document, {
+      gaps: document.gaps.length,
+      shown: rows.length,
+      truncated: document.gaps.length > gapLimit || rows.truncated,
+    })),
+  };
+}
+
+async function runEntries(filePath: string, args: string[]): Promise<CommandResult> {
+  let from: number | undefined;
+  let to: number | undefined;
+  let limit = 200;
+  let kinds: ReadonlySet<string> | undefined;
+  while (args.length > 0) {
+    const option = args.shift()!;
+    if (option === '--from') from = integerOption(take(args, option), option, 1);
+    else if (option === '--to') to = integerOption(take(args, option), option, 1);
+    else if (option === '--limit') limit = integerOption(take(args, option), option, 1, MAX_ROWS);
+    else if (option === '--kind') {
+      const values = take(args, option).split(',');
+      if (values.some((value) => !/^[a-z][a-z0-9-]*$/.test(value))) {
+        throw new UsageError('--kind must contain comma-separated entry tags');
+      }
+      kinds = new Set(values);
+    } else throw new UsageError(`unknown entries option: ${option}`);
+  }
+  if (from !== undefined && to !== undefined && from > to) throw new UsageError('--from exceeds --to');
+  const rows = new BoundedRows();
+  let matched = 0;
+  let selected = 0;
+  const visitor: GarconXmlVisitor = {
+    onEntryStart(entry) {
+      if (!ordinalInRange(entry.ordinal, from, to) || (kinds && !kinds.has(entry.tag))) return;
+      matched += 1;
+      if (selected < limit) {
+        selected += 1;
+        rows.push(entryRow(entry));
+      }
+    },
+    onGap(gap) {
+      if (!gapInRange(gap, from, to) || (kinds && !kinds.has('gap'))) return;
+      matched += 1;
+      if (selected < limit) {
+        selected += 1;
+        rows.push(gapRow(gap));
+      }
+    },
+  };
+  const document = await scanCanonicalGarconXml(filePath, visitor);
+  return {
+    rows: rows.finish(summaryRow(document, {
+      matched,
+      shown: rows.length,
+      truncated: matched > selected || rows.truncated,
+    })),
+  };
+}
+
+async function runSearch(filePath: string, args: string[]): Promise<CommandResult> {
+  let literal: string | undefined;
+  let where = 'any';
+  let ignoreCase = false;
+  let snippet = 160;
+  let limit = 20;
+  let maximumPerEntry = 3;
+  while (args.length > 0) {
+    const option = args.shift()!;
+    if (option === '--literal') literal = take(args, option);
+    else if (option === '--where') where = take(args, option);
+    else if (option === '--ignore-case') ignoreCase = true;
+    else if (option === '--snippet') snippet = integerOption(take(args, option), option, 0, MAX_SNIPPET);
+    else if (option === '--limit') limit = integerOption(take(args, option), option, 1, MAX_ROWS);
+    else if (option === '--max-per-entry') {
+      maximumPerEntry = integerOption(take(args, option), option, 1, 1000);
+    } else throw new UsageError(`unknown search option: ${option}`);
+  }
+  if (literal === undefined || literal === '') throw new UsageError('search requires a nonempty --literal');
+  if (literal.length > MAX_LITERAL) throw new UsageError(`--literal exceeds ${MAX_LITERAL} characters`);
+  if (!validWhere(where)) throw new UsageError(`invalid --where value: ${where}`);
+
+  const rows = new BoundedRows();
+  let totalMatches = 0;
+  let entryMatches = 0;
+  let selected = 0;
+  let matcher: StreamingLiteralMatcher | undefined;
+  let currentArea: GarconXmlArea | undefined;
+  const visitor: GarconXmlVisitor = {
+    onEntryStart() {
+      entryMatches = 0;
+    },
+    onAreaStart(entry, area) {
+      currentArea = area;
+      if (!areaMatches(area, where)) return;
+      matcher = new StreamingLiteralMatcher(literal, ignoreCase, snippet, (text, clipped) => {
+        totalMatches += 1;
+        if (entryMatches >= maximumPerEntry || selected >= limit) return;
+        entryMatches += 1;
+        selected += 1;
+        const match: SearchMatch = { entry, area, snippet: text, clipped };
+        rows.push(searchRow(match));
+      });
+    },
+    onAreaText(_entry, area, text) {
+      if (matcher !== undefined && area === currentArea) matcher.push(text);
+    },
+    onAreaEnd(_entry, area) {
+      if (matcher !== undefined && area === currentArea) matcher.finish();
+      matcher = undefined;
+      currentArea = undefined;
+    },
+  };
+  const document = await scanCanonicalGarconXml(filePath, visitor);
+  return {
+    rows: rows.finish(summaryRow(document, {
+      matches: totalMatches,
+      shown: rows.length,
+      truncated: totalMatches > selected || rows.truncated,
+    })),
+  };
+}
+
+async function runShow(filePath: string, args: string[]): Promise<CommandResult> {
+  const ordinals = new Set<number>();
+  const ranges: Array<readonly [number, number]> = [];
+  let part = 'all';
+  let offset = 0;
+  let maximumCharacters = 4_000;
+  let maximumLines = 80;
+  let limit = 20;
+  while (args.length > 0) {
+    const option = args.shift()!;
+    if (option === '--ordinal') addOrdinalValues(ordinals, take(args, option));
+    else if (option === '--range') ranges.push(parseRange(take(args, option)));
+    else if (option === '--part') part = take(args, option);
+    else if (option === '--offset') offset = integerOption(take(args, option), option, 0);
+    else if (option === '--max-chars') {
+      maximumCharacters = integerOption(take(args, option), option, 1, MAX_SHOW_CHARACTERS);
+    } else if (option === '--max-lines') maximumLines = integerOption(take(args, option), option, 1, 10_000);
+    else if (option === '--limit') limit = integerOption(take(args, option), option, 1, 1000);
+    else throw new UsageError(`unknown show option: ${option}`);
+  }
+  if (ordinals.size === 0 && ranges.length === 0) {
+    throw new UsageError('show requires --ordinal or --range');
+  }
+  if (!validPart(part)) throw new UsageError(`invalid --part value: ${part}`);
+  return collectShownEntries(filePath, {
+    selected: (ordinal) => ordinals.has(ordinal) || ranges.some(([start, end]) => ordinal >= start && ordinal <= end),
+    explicitlyRequested: ordinals,
+    part,
+    offset,
+    maximumCharacters,
+    maximumLines,
+    limit,
+  });
+}
+
+async function runToolId(filePath: string, args: string[]): Promise<CommandResult> {
+  let id: string | undefined;
+  let maximumCharacters = 2_000;
+  let maximumLines = 40;
+  let limit = 100;
+  while (args.length > 0) {
+    const option = args.shift()!;
+    if (option === '--id') id = take(args, option);
+    else if (option === '--max-chars') {
+      maximumCharacters = integerOption(take(args, option), option, 1, MAX_SHOW_CHARACTERS);
+    } else if (option === '--max-lines') maximumLines = integerOption(take(args, option), option, 1, 10_000);
+    else if (option === '--limit') limit = integerOption(take(args, option), option, 1, 1000);
+    else throw new UsageError(`unknown tool-id option: ${option}`);
+  }
+  if (id === undefined || id === '') throw new UsageError('tool-id requires a nonempty --id');
+  return collectShownEntries(filePath, {
+    selected: (_ordinal, entry) => entry.attributes.get('tool-id') === id,
+    explicitlyRequested: new Set(),
+    missingWhenNoMatches: true,
+    part: 'all',
+    offset: 0,
+    maximumCharacters,
+    maximumLines,
+    limit,
+  });
+}
+
+async function collectShownEntries(filePath: string, options: {
+  readonly selected: (ordinal: number, entry: GarconXmlEntry) => boolean;
+  readonly explicitlyRequested: ReadonlySet<number>;
+  readonly missingWhenNoMatches?: boolean;
+  readonly part: string;
+  readonly offset: number;
+  readonly maximumCharacters: number;
+  readonly maximumLines: number;
+  readonly limit: number;
+}): Promise<CommandResult> {
+  const rows = new BoundedRows();
+  const seen = new Set<number>();
+  let matched = 0;
+  let active = false;
+  let shownEntries = 0;
+  let currentArea: GarconXmlArea | undefined;
+  let capture: PartCapture | undefined;
+  const visitor: GarconXmlVisitor = {
+    onEntryStart(entry) {
+      active = options.selected(entry.ordinal, entry);
+      if (!active) return;
+      seen.add(entry.ordinal);
+      matched += 1;
+      if (matched <= options.limit) {
+        if (rows.push(row(
+          ordinalCell(entry.ordinal),
+          entry.tag,
+          'entry',
+          ...attributeCells(entry.attributes, 'ordinal'),
+        ))) shownEntries += 1;
+      }
+    },
+    onAreaStart(_entry, area) {
+      currentArea = area;
+      if (
+        !active
+        || matched > options.limit
+        || rows.truncated
+        || !partMatches(area, options.part)
+      ) return;
+      capture = new PartCapture(options.offset, options.maximumCharacters, options.maximumLines);
+    },
+    onAreaText(_entry, area, text) {
+      if (capture !== undefined && area === currentArea) capture.push(text);
+    },
+    onAreaEnd(entry, area) {
+      if (capture !== undefined && area === currentArea) {
+        const result = capture.finish();
+        const escaped = escapeCellWithStatus(result.text);
+        rows.push(row(
+          ordinalCell(entry.ordinal),
+          entry.tag,
+          areaCell(area),
+          escaped.value,
+          `clipped=${result.clipped || escaped.clipped}`,
+        ));
+      }
+      capture = undefined;
+      currentArea = undefined;
+    },
+    onEntryEnd() {
+      active = false;
+    },
+  };
+  const document = await scanCanonicalGarconXml(filePath, visitor);
+  const missing = [...options.explicitlyRequested].filter((ordinal) => !seen.has(ordinal));
+  const selectionMissing = options.missingWhenNoMatches === true && matched === 0;
+  const missingCount = missing.length + Number(selectionMissing);
+  for (const ordinal of missing) rows.push(row(`ordinal=${ordinal}`, 'absent', absentReason(ordinal, document)));
+  return {
+    rows: rows.finish(summaryRow(document, {
+      matched,
+      shown: shownEntries,
+      missing: missingCount,
+      truncated: matched > options.limit || rows.truncated,
+    })),
+    missing: missingCount > 0,
+  };
+}
+
+async function runAudit(filePath: string, args: string[]): Promise<CommandResult> {
+  const requestedOrdinals: number[] = [];
+  const draftPaths: string[] = [];
+  while (args.length > 0) {
+    const option = args.shift()!;
+    if (option === '--ordinal') addAuditValues(requestedOrdinals, take(args, option));
+    else if (option === '--draft') draftPaths.push(take(args, option));
+    else throw new UsageError(`unknown audit option: ${option}`);
+  }
+  if (requestedOrdinals.length === 0 && draftPaths.length === 0) {
+    throw new UsageError('audit requires --ordinal or --draft');
+  }
+  const citationIndex = createCitationIndex();
+  for (const draftPath of draftPaths) {
+    const draft = await readBoundedDraft(draftPath);
+    indexCitationsFromDraft(draft, citationIndex);
+  }
+  const candidateOrdinals = new Set(requestedOrdinals);
+  let foreignCitationCount = 0;
+  let draftCitationsResolved = false;
+  const resolveDraftCitations = (chatId?: string): void => {
+    if (draftCitationsResolved) return;
+    for (const [citationChatId, count] of citationIndex.scopedOccurrences) {
+      if (chatId !== undefined && citationChatId !== chatId) {
+        foreignCitationCount += count;
+      }
+    }
+    for (const endpoint of citationIndex.endpoints) {
+      if (
+        endpoint.chatId !== undefined
+        && chatId !== undefined
+        && endpoint.chatId !== chatId
+      ) continue;
+      candidateOrdinals.add(endpoint.ordinal);
+    }
+    if (candidateOrdinals.size > MAX_ROWS) {
+      throw new UsageError(`audit exceeds ${MAX_ROWS} distinct ordinals`);
+    }
+    draftCitationsResolved = true;
+  };
+  const entryTagsByOrdinal = new Map<number, string>();
+  const visitor: GarconXmlVisitor = {
+    onRoot(kind, attributes) {
+      if (kind !== 'handoff-artifact') return;
+      const chatId = attributes.get('chat-id');
+      if (chatId !== undefined) resolveDraftCitations(chatId);
+    },
+    onMetadata(metadata) {
+      if (draftCitationsResolved || metadata.tag !== 'chat') return;
+      const chatId = metadata.attributes.get('id');
+      if (chatId !== undefined) resolveDraftCitations(chatId);
+    },
+    onEntryStart(entry) {
+      if (!draftCitationsResolved) resolveDraftCitations();
+      if (candidateOrdinals.has(entry.ordinal)) entryTagsByOrdinal.set(entry.ordinal, entry.tag);
+    },
+  };
+  const document = await scanCanonicalGarconXml(filePath, visitor);
+  if (!draftCitationsResolved) resolveDraftCitations();
+  const auditedOrdinals = [...candidateOrdinals];
+  const rows = new BoundedRows();
+  for (const candidate of citationIndex.unparsedSamples) {
+    rows.push(row('citation', 'unparsed', escapeCell(candidate)));
+  }
+  let missingCount = 0;
+  for (const ordinal of auditedOrdinals) {
+    const tag = entryTagsByOrdinal.get(ordinal);
+    if (tag === undefined) {
+      missingCount += 1;
+      rows.push(row(`ordinal=${ordinal}`, 'absent', absentReason(ordinal, document)));
+    } else {
+      rows.push(row(ordinalCell(ordinal), 'present', tag));
+    }
+  }
+  return {
+    rows: rows.finish(summaryRow(document, {
+      audited: auditedOrdinals.length,
+      missing: missingCount,
+      'foreign-citations': foreignCitationCount,
+      'unparsed-citations': citationIndex.unparsedCount,
+      truncated: rows.truncated,
+    })),
+    missing: missingCount > 0 || citationIndex.unparsedCount > 0,
+  };
+}
+
+function entryRow(entry: GarconXmlEntry): string {
+  return row(ordinalCell(entry.ordinal), entry.tag, ...attributeCells(entry.attributes, 'ordinal'));
+}
+
+function searchRow(match: SearchMatch): string {
+  const escaped = escapeCellWithStatus(match.snippet);
+  return row(
+    ordinalCell(match.entry.ordinal),
+    match.entry.tag,
+    areaCell(match.area),
+    escaped.value,
+    `clipped=${match.clipped || escaped.clipped}`,
+  );
+}
+
+function gapRow(gap: { afterOrdinal?: number; beforeOrdinal?: number; omittedEntries: number }): string {
+  return row(
+    'gap',
+    ...(gap.afterOrdinal === undefined ? [] : [`after-ordinal=${gap.afterOrdinal}`]),
+    ...(gap.beforeOrdinal === undefined ? [] : [`before-ordinal=${gap.beforeOrdinal}`]),
+    `omitted-entries=${gap.omittedEntries}`,
+  );
+}
+
+function summaryRow(document: GarconXmlDocument, values: Readonly<Record<string, string | number | boolean>>): string {
+  return row(
+    'summary',
+    `entries=${document.entryCount}`,
+    ...(document.firstOrdinal === undefined ? [] : [`first-ordinal=${ordinalCell(document.firstOrdinal)}`]),
+    ...(document.lastOrdinal === undefined ? [] : [`last-ordinal=${ordinalCell(document.lastOrdinal)}`]),
+    ...(document.unknownEntryTags.length === 0
+      ? []
+      : [`unknown-entry-tags=${document.unknownEntryTags.length}`]),
+    ...(document.unknownMetadataTags.length === 0
+      ? []
+      : [`unknown-metadata-tags=${document.unknownMetadataTags.length}`]),
+    ...(document.crossKindStructures.length === 0
+      ? []
+      : [`cross-kind-structures=${document.crossKindStructures.length}`]),
+    ...Object.entries(values).map(([name, value]) => `${name}=${value}`),
+  );
+}
+
+function attributeCells(attributes: ReadonlyMap<string, string>, excluded?: string): string[] {
+  const included = [...attributes].filter(([name]) => name !== excluded);
+  return [
+    ...included.slice(0, MAX_ATTRIBUTES_PER_ROW)
+      .map(([name, value]) => `attribute:${name}=${escapeCell(value)}`),
+    ...(included.length > MAX_ATTRIBUTES_PER_ROW
+      ? [`attributes-suppressed=${included.length - MAX_ATTRIBUTES_PER_ROW}`]
+      : []),
+  ];
+}
+
+function areaCell(area: GarconXmlArea): string {
+  return area.kind === 'text' ? 'text' : `${area.kind}:${escapeCell(area.name)}`;
+}
+
+function ordinalCell(ordinal: number): string {
+  return `#${ordinal}`;
+}
+
+function row(...cells: string[]): string {
+  return cells.join('\t');
+}
+
+function escapeCell(value: string): string {
+  return escapeCellWithStatus(value).value;
+}
+
+function escapeCellWithStatus(value: string): { readonly value: string; readonly clipped: boolean } {
+  const escaped = value
+    .replaceAll('\\', '\\\\')
+    .replaceAll('\t', '\\t')
+    .replaceAll('\r', '\\r')
+    .replaceAll('\n', '\\n');
+  return escaped.length <= MAX_CELL_CHARACTERS
+    ? { value: escaped, clipped: false }
+    : { value: `${escaped.slice(0, MAX_CELL_CHARACTERS)}…[cell-clipped]`, clipped: true };
+}
+
+function foldAscii(value: string): string {
+  return value.replace(/[A-Z]/g, (character) => character.toLowerCase());
+}
+
+function validWhere(value: string): boolean {
+  return value === 'any'
+    || value === 'text'
+    || value === 'field'
+    || value === 'attribute'
+    || /^field:.+/.test(value)
+    || /^attribute:.+/.test(value);
+}
+
+function areaMatches(area: GarconXmlArea, where: string): boolean {
+  if (where === 'any') return true;
+  if (where === area.kind) return true;
+  const separator = where.indexOf(':');
+  return separator > 0 && where.slice(0, separator) === area.kind && where.slice(separator + 1) === area.name;
+}
+
+function validPart(value: string): boolean {
+  return value === 'all'
+    || value === 'text'
+    || value === 'attributes'
+    || value === 'field'
+    || /^field:.+/.test(value);
+}
+
+function partMatches(area: GarconXmlArea, part: string): boolean {
+  if (part === 'all') return true;
+  if (part === 'attributes') return area.kind === 'attribute';
+  if (part === area.kind) return true;
+  return part.startsWith('field:') && area.kind === 'field' && part.slice(6) === area.name;
+}
+
+function ordinalInRange(ordinal: number, from?: number, to?: number): boolean {
+  return (from === undefined || ordinal >= from) && (to === undefined || ordinal <= to);
+}
+
+function gapInRange(
+  gap: { afterOrdinal?: number; beforeOrdinal?: number },
+  from?: number,
+  to?: number,
+): boolean {
+  const anchor = gap.beforeOrdinal ?? gap.afterOrdinal;
+  if (anchor === undefined) return true;
+  return ordinalInRange(anchor, from, to);
+}
+
+function absentReason(ordinal: number, document: GarconXmlDocument): string {
+  return document.lastOrdinal !== undefined && ordinal > document.lastOrdinal
+    ? 'above-last-ordinal'
+    : 'no-such-entry';
+}
+
+function parseRange(value: string): readonly [number, number] {
+  const match = /^([1-9][0-9]*)-([1-9][0-9]*)$/.exec(value);
+  if (match === null) throw new UsageError(`invalid ordinal range: ${value}`);
+  const start = integerOption(match[1], 'range start', 1);
+  const end = integerOption(match[2], 'range end', 1);
+  if (start > end) throw new UsageError(`range start exceeds end: ${value}`);
+  return [start, end];
+}
+
+function addOrdinalValues(target: Set<number>, value: string): void {
+  for (const item of value.split(',')) {
+    target.add(integerOption(item, '--ordinal', 1));
+    if (target.size > MAX_ROWS) throw new UsageError(`too many ordinals; maximum is ${MAX_ROWS}`);
+  }
+}
+
+function addAuditValues(target: number[], value: string): void {
+  for (const item of value.split(',')) {
+    if (item.includes('-')) target.push(...parseRange(item));
+    else target.push(integerOption(item, '--ordinal', 1));
+  }
+}
+
+interface CitationEndpoint {
+  readonly chatId?: string;
+  readonly ordinal: number;
+}
+
+interface CitationIndex {
+  readonly endpointKeys: Set<string>;
+  readonly endpoints: CitationEndpoint[];
+  readonly scopedOccurrences: Map<string, number>;
+  unparsedCount: number;
+  readonly unparsedSamples: string[];
+}
+
+function createCitationIndex(): CitationIndex {
+  return {
+    endpointKeys: new Set(),
+    endpoints: [],
+    scopedOccurrences: new Map(),
+    unparsedCount: 0,
+    unparsedSamples: [],
+  };
+}
+
+function indexCitationsFromDraft(value: string, citationIndex: CitationIndex): void {
+  for (const candidateMatch of value.matchAll(CITATION_CANDIDATE_PATTERN)) {
+    const candidate = candidateMatch[0];
+    const match = CITATION_PATTERN.exec(candidate);
+    if (match === null) {
+      indexUnparsedCitation(citationIndex, candidate);
+      continue;
+    }
+    const start = safePositiveInteger(match[2]);
+    const end = match[3] === undefined ? undefined : safePositiveInteger(match[3]);
+    if (
+      start === undefined
+      || (match[3] !== undefined && end === undefined)
+      || (end !== undefined && start > end)
+    ) {
+      indexUnparsedCitation(citationIndex, candidate);
+      continue;
+    }
+    const chatId = match[1];
+    if (chatId !== undefined) {
+      const occurrences = citationIndex.scopedOccurrences.get(chatId) ?? 0;
+      citationIndex.scopedOccurrences.set(chatId, occurrences + 1);
+    }
+    indexCitationEndpoint(citationIndex, chatId, start);
+    if (end !== undefined) indexCitationEndpoint(citationIndex, chatId, end);
+  }
+}
+
+function indexUnparsedCitation(citationIndex: CitationIndex, candidate: string): void {
+  citationIndex.unparsedCount += 1;
+  if (citationIndex.unparsedSamples.length < 20) citationIndex.unparsedSamples.push(candidate);
+}
+
+function indexCitationEndpoint(
+  citationIndex: CitationIndex,
+  chatId: string | undefined,
+  ordinal: number,
+): void {
+  const key = chatId === undefined ? `#${ordinal}` : `${chatId}#${ordinal}`;
+  if (citationIndex.endpointKeys.has(key)) return;
+  if (citationIndex.endpointKeys.size >= MAX_ROWS) {
+    throw new UsageError(`audit exceeds ${MAX_ROWS} distinct citation endpoints`);
+  }
+  citationIndex.endpointKeys.add(key);
+  citationIndex.endpoints.push(chatId === undefined ? { ordinal } : { chatId, ordinal });
+}
+
+function safePositiveInteger(value: string): number | undefined {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+async function readBoundedDraft(filePath: string): Promise<string> {
+  if (!path.isAbsolute(filePath)) throw new UsageError('--draft path must be absolute');
+  let info;
+  try {
+    info = await lstat(filePath);
+  } catch (error) {
+    throw new UsageError(`cannot read --draft: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!info.isFile() || info.isSymbolicLink()) throw new UsageError('--draft must be a regular non-symlink file');
+  if (info.size > MAX_DRAFT_BYTES) throw new UsageError(`--draft exceeds ${MAX_DRAFT_BYTES} bytes`);
+  try {
+    return await readFile(filePath, 'utf8');
+  } catch (error) {
+    throw new UsageError(`cannot read --draft: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function take(args: string[], option: string): string {
+  const value = args.shift();
+  if (value === undefined) throw new UsageError(`${option} requires a value`);
+  return value;
+}
+
+function integerOption(
+  value: string,
+  option: string,
+  minimum: number,
+  maximum = Number.MAX_SAFE_INTEGER,
+): number {
+  if (!/^(0|[1-9][0-9]*)$/.test(value)) throw new UsageError(`${option} must be an integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new UsageError(`${option} must be from ${minimum} through ${maximum}`);
+  }
+  return parsed;
+}
+
+function requireNoArguments(args: string[], usage: string): void {
+  if (args.length > 0) throw new UsageError(usage);
+}
+
+try {
+  const result = await run(Bun.argv.slice(2));
+  process.stdout.write(renderBoundedOutput(result.rows));
+  if (result.missing) process.exitCode = 4;
+} catch (error) {
+  if (error instanceof UsageError || error instanceof GarconXmlInputError) {
+    console.error(`transcript-query: ${error.message}`);
+    process.exitCode = 3;
+  } else if (error instanceof GarconXmlDocumentError) {
+    console.error(`transcript-query: rejected document: ${error.message}`);
+    process.exitCode = 2;
+  } else {
+    console.error(`transcript-query: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
+}
+
+function renderBoundedOutput(rows: readonly string[]): string {
+  if (rows.length === 0) return '';
+  const lines = rows.map((value) => `${value}\n`);
+  const byteLengths = lines.map((value) => OUTPUT_ENCODER.encode(value).byteLength);
+  const totalBytes = byteLengths.reduce((sum, value) => sum + value, 0);
+  if (totalBytes <= MAX_OUTPUT_BYTES) return lines.join('');
+
+  const trailer = lines.at(-1)!;
+  const trailerBytes = byteLengths.at(-1)!;
+  const shown: string[] = [];
+  let shownBytes = 0;
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    const candidate = lines[index];
+    const candidateBytes = byteLengths[index];
+    const marker = outputTruncationMarker(shown.length + 1, rows.length);
+    const markerBytes = OUTPUT_ENCODER.encode(marker).byteLength;
+    if (shownBytes + candidateBytes + markerBytes + trailerBytes > MAX_OUTPUT_BYTES) break;
+    shown.push(candidate);
+    shownBytes += candidateBytes;
+  }
+  return `${shown.join('')}${outputTruncationMarker(shown.length, rows.length)}${trailer}`;
+}
+
+function outputTruncationMarker(shownRows: number, totalRows: number): string {
+  return `output\ttruncated=true\tshown-rows=${shownRows}\ttotal-rows=${totalRows}\n`;
+}
