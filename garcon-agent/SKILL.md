@@ -106,7 +106,7 @@ Omit `--provider`, `--reasoning-effort`, and other optional flags when not selec
 
 Common request mapping:
 
-- “Get Pi `alibaba-token-plan/qwen-3.8-max-preview` to implement…” means discover and validate agent `pi`, provider `alibaba-token-plan`, and that model; use the exact worktree, `bypassPermissions`, and no title or extra tags unless requested.
+- “Get Pi `openrouter/glm-5.2` to implement…” means discover and validate agent `pi`, provider `openrouter`, and that model; use the exact worktree, `bypassPermissions`, and no title or extra tags unless requested.
 - “Get Claude opus at max effort to review…, add the review tag” means discover the unique Claude agent and opus model, validate `max`, use `plan`, add `--tag review`, and omit `--title`.
 - For multiple consultants, create one chat per agent and keep each chat ID paired with its selection.
 

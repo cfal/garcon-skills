@@ -36,14 +36,14 @@ PROVIDER=''
 MODEL=''
 EFFORT_OR_VARIANT=''
 WORK_PATH=$GARCON_PATH
-CONFIGURED_SPEC=''
+CONFIGURED_VALUE=''
 PRIMARY_SPEC=''
 TITLE_SPEC_LABEL=''
 
 usage() {
   if [[ "$ROLE" == oracle ]]; then
-    printf 'Usage: %s [--review] [--spec <agent-spec>] [--] <prompt>\n' "$ROLE" >&2
-    printf '       %s --start [--review] [--spec <agent-spec>] [--additional-spec <agent-spec>]... [--] <prompt>\n' "$ROLE" >&2
+    printf 'Usage: %s [--review] [--no-defaults] [--spec <agent-spec>]... [--] <prompt>\n' "$ROLE" >&2
+    printf '       %s --start [--review] [--no-defaults] [--spec <agent-spec>]... [--] <prompt>\n' "$ROLE" >&2
   elif [[ "$ROLE" == reporter ]]; then
     printf 'Usage: %s <goal>\n' "$ROLE" >&2
     printf '       %s --start <goal>\n' "$ROLE" >&2
@@ -64,14 +64,16 @@ status_wait_ms=0
 status_wait_bounded=0
 status_wait_active=0
 prompt_escaped=0
-spec_override=''
-spec_override_set=0
-additional_specs=()
+no_defaults=0
+runtime_specs=()
+configured_specs=()
 reviewer_specs=()
+reviewer_child_pids=()
 reviewer_count=1
 reviewer_success_count=1
 run_outcome=finished
 async_title_detail=async
+group_title_detail=''
 
 enable_review() {
   if [[ "$ROLE" != oracle ]]; then
@@ -117,26 +119,21 @@ if [[ "$mode" == blocking || "$mode" == start || "$mode" == detached ]]; then
         ;;
       --spec)
         require_oracle_option --spec
-        if (( spec_override_set )) || (( $# < 2 )) || [[ "$2" == --* ]]; then
-          usage
-          exit 2
-        fi
-        spec_override=$2
-        spec_override_set=1
-        shift 2
-        ;;
-      --additional-spec)
-        require_oracle_option --additional-spec
-        if [[ "$mode" != start && "$mode" != detached ]]; then
-          printf '%s: --additional-spec requires --start\n' "$ROLE" >&2
-          exit 2
-        fi
         if (( $# < 2 )) || [[ "$2" == --* ]]; then
           usage
           exit 2
         fi
-        additional_specs+=("$2")
+        runtime_specs+=("$2")
         shift 2
+        ;;
+      --no-defaults)
+        require_oracle_option --no-defaults
+        if (( no_defaults )); then
+          usage
+          exit 2
+        fi
+        no_defaults=1
+        shift
         ;;
       *) break ;;
     esac
@@ -219,7 +216,7 @@ load_role_config() {
     exit 1
   fi
 
-  CONFIGURED_SPEC=$spec
+  CONFIGURED_VALUE=$spec
 }
 
 parse_agent_spec() {
@@ -228,6 +225,7 @@ parse_agent_spec() {
   PROVIDER=''
   MODEL=''
   EFFORT_OR_VARIANT=''
+  [[ "$spec" != *,* ]] || return 1
   IFS=: read -r AGENT first second third extra <<<"$spec"
   case "$AGENT" in
     codex)
@@ -273,48 +271,81 @@ parse_agent_spec() {
 
 if [[ "$mode" != status && "$mode" != kill ]]; then
   load_role_config
-  if ! parse_agent_spec "$CONFIGURED_SPEC"; then
-    printf '%s: invalid active agent spec: %s\n' "$ROLE" "$CONFIGURED_SPEC" >&2
-    exit 1
-  fi
-
-  PRIMARY_SPEC=$CONFIGURED_SPEC
-  if (( spec_override_set )); then
-    PRIMARY_SPEC=$spec_override
-    if ! parse_agent_spec "$PRIMARY_SPEC"; then
-      printf '%s: invalid --spec agent spec: %s\n' "$ROLE" "$PRIMARY_SPEC" >&2
-      exit 2
+  if [[ "$ROLE" == oracle ]]; then
+    if [[ "$CONFIGURED_VALUE" == ,* || "$CONFIGURED_VALUE" == *, || "$CONFIGURED_VALUE" == *,,* ]]; then
+      printf '%s: invalid active Oracle reviewer list\n' "$ROLE" >&2
+      exit 1
     fi
+    IFS=, read -r -a configured_specs <<<"$CONFIGURED_VALUE"
+  else
+    configured_specs=("$CONFIGURED_VALUE")
   fi
 
-  reviewer_specs=("$PRIMARY_SPEC")
-
-  validated_additional_specs=()
-  for spec in "${additional_specs[@]}"; do
+  validated_configured_specs=()
+  for index in "${!configured_specs[@]}"; do
+    spec=${configured_specs[index]}
     if ! parse_agent_spec "$spec"; then
-      printf '%s: invalid --additional-spec agent spec: %s\n' "$ROLE" "$spec" >&2
+      if [[ "$ROLE" == oracle ]]; then
+        printf '%s: invalid active agent spec for configured reviewer %s\n' \
+          "$ROLE" "$((index + 1))" >&2
+      else
+        printf '%s: invalid active agent spec\n' "$ROLE" >&2
+      fi
+      exit 1
+    fi
+    for selected_spec in "${validated_configured_specs[@]}"; do
+      if [[ "$spec" == "$selected_spec" ]]; then
+        printf '%s: duplicate active agent spec for configured reviewer %s\n' \
+          "$ROLE" "$((index + 1))" >&2
+        exit 1
+      fi
+    done
+    validated_configured_specs+=("$spec")
+  done
+
+  if (( no_defaults )); then
+    reviewer_specs=()
+  else
+    reviewer_specs=("${configured_specs[@]}")
+  fi
+
+  validated_runtime_specs=()
+  for spec in "${runtime_specs[@]}"; do
+    if ! parse_agent_spec "$spec"; then
+      printf '%s: invalid --spec agent spec: %s\n' "$ROLE" "$spec" >&2
       exit 2
     fi
-    for selected_spec in "${validated_additional_specs[@]}"; do
+    for selected_spec in "${validated_runtime_specs[@]}"; do
       if [[ "$spec" == "$selected_spec" ]]; then
         printf '%s: duplicate reviewer agent spec: %s\n' "$ROLE" "$spec" >&2
         exit 2
       fi
     done
-    validated_additional_specs+=("$spec")
-    if [[ "$spec" == "$PRIMARY_SPEC" ]]; then
-      if (( spec_override_set )); then
-        printf '%s: duplicate reviewer agent spec: %s\n' "$ROLE" "$spec" >&2
-        exit 2
-      fi
-      continue
+    validated_runtime_specs+=("$spec")
+    if (( ! no_defaults )); then
+      configured_match=0
+      for selected_spec in "${configured_specs[@]}"; do
+        if [[ "$spec" == "$selected_spec" ]]; then
+          configured_match=1
+          break
+        fi
+      done
+      (( configured_match )) && continue
     fi
     reviewer_specs+=("$spec")
   done
+
+  if (( ${#reviewer_specs[@]} == 0 )); then
+    printf '%s: --no-defaults requires at least one --spec\n' "$ROLE" >&2
+    exit 2
+  fi
+
   reviewer_count=${#reviewer_specs[@]}
+  PRIMARY_SPEC=${reviewer_specs[0]}
   TITLE_SPEC_LABEL=$PRIMARY_SPEC
   if (( reviewer_count > 1 )); then
-    async_title_detail+=", $reviewer_count reviewers"
+    group_title_detail="$reviewer_count reviewers"
+    async_title_detail+=", $group_title_detail"
     TITLE_SPEC_LABEL="primary: $PRIMARY_SPEC"
   fi
 
@@ -394,8 +425,34 @@ trap on_exit EXIT
 # A terminating signal must produce a deterministic status: without these traps
 # Bash can leave $? at 0 in the EXIT trap after the foreground child is killed,
 # which would report an interrupted consultation as a successful one.
+terminate_reviewer_children() {
+  local pid attempt alive
+  for pid in "${reviewer_child_pids[@]}"; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    signal_run TERM "$pid"
+  done
+  for ((attempt = 0; attempt < 4; attempt++)); do
+    alive=0
+    for pid in "${reviewer_child_pids[@]}"; do
+      if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && run_process_group_is_alive "$pid"; then
+        alive=1
+        break
+      fi
+    done
+    (( alive )) || break
+    sleep 0.1 &
+    wait $! || true
+  done
+  for pid in "${reviewer_child_pids[@]}"; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    run_process_group_is_alive "$pid" && signal_run KILL "$pid"
+  done
+  reviewer_child_pids=()
+}
+
 on_termination_signal() {
   killed_by_signal=1
+  terminate_reviewer_children
   if (( status_wait_active )); then
     status_wait_active=0
     load_run_state || true
@@ -803,9 +860,9 @@ do_start() {
   chmod 600 "$RUN_LOG"
 
   if (( review_mode )); then detached_command+=(--review); fi
-  if (( spec_override_set )); then detached_command+=(--spec "$spec_override"); fi
-  for spec in "${additional_specs[@]}"; do
-    detached_command+=(--additional-spec "$spec")
+  if (( no_defaults )); then detached_command+=(--no-defaults); fi
+  for spec in "${runtime_specs[@]}"; do
+    detached_command+=(--spec "$spec")
   done
   detached_command+=("$PROMPT_FILE")
   "${detached_command[@]}" </dev/null >>"$RUN_LOG" 2>&1 &
@@ -931,7 +988,7 @@ try {
   await consume(decoder.decode());
   await flush();
 } catch (error) {
-  console.error(`${role}: failed to publish ${title}: ${error instanceof Error ? error.message : String(error)}`);
+  console.error(`${role}: failed to publish transcript row: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 }
 ' "$GARCON_CLI_RUNNER" "$GARCON_CLI_PATH" "$CHAT_ID" "$title" "$content_file" "$GARCON_PATH" "$ROLE" "$ROLE_ACCENT"
@@ -940,6 +997,8 @@ try {
 request_title="$ROLE_ACTIVITY_TITLE request"
 if [[ "$mode" == detached ]]; then
   request_title+=" ($async_title_detail)"
+elif [[ -n "$group_title_detail" ]]; then
+  request_title+=" ($group_title_detail)"
 fi
 request_title="$(title_with_spec "$request_title")"
 
@@ -964,7 +1023,7 @@ Shared sandbox directory: %s
 
 Treat this request as self-contained. The parent/orchestrator owns the user task, all intended changes to the target repository, integration, final verification, and user communication.
 
-You may read any path available to the current OS user. The parent and every Garcon-Amp specialist for this chat share the sandbox. Reuse any checkout, source, or artifact named in the request or already present there; never duplicate one that is safe and usable for the requested operation. Put direct investigative writes in the shared sandbox and give new artifacts distinct names. Acquire any source only when the role prompt permits it, the current request requires it, and no available source is safe and usable for that permitted operation; keep it at an absolute path in the shared sandbox and report its origin and path. Do not intentionally modify the target repository or its Git state, and do not delegate to another agent.
+You may read any path available to the current OS user. The parent and every Garcon-Amp specialist for this chat share the sandbox. Reuse any checkout, source, or artifact named in the request or already present there; never duplicate one that is safe and usable for the requested operation. Only when the role prompt permits investigative writes, put them in the shared sandbox and give new artifacts distinct names. Acquire any source only when the role prompt permits it, the current request requires it, and no available source is safe and usable for that permitted operation; keep it at an absolute path in the shared sandbox and report its origin and path. Do not intentionally modify the target repository or its Git state, and do not delegate to another agent.
 
 Return a complete result; no one can answer questions during this invocation.
 
@@ -1010,8 +1069,10 @@ print_invocation_prompt() {
 }
 
 run_codex() {
-  local events_file response_file status
+  local events_file response_file sandbox_mode=danger-full-access status
   local -a command=(codex)
+
+  if [[ "$ROLE" == finder ]]; then sandbox_mode=read-only; fi
 
   events_file="$(mktemp "$STATE_PATH/.$ROLE.$AGENT.events.XXXXXX")"
   response_file="$(mktemp "$STATE_PATH/.$ROLE.$AGENT.response.XXXXXX")"
@@ -1023,7 +1084,7 @@ run_codex() {
   fi
   command+=(
     --ask-for-approval never
-    --sandbox danger-full-access
+    --sandbox "$sandbox_mode"
     --cd "$WORK_PATH"
     exec
     --skip-git-repo-check
@@ -1072,17 +1133,20 @@ process.stdout.write(result.endsWith("\n") ? result : `${result}\n`);
 }
 
 run_claude() {
-  local status variable
+  local status tool_names='Bash,Edit,Glob,Grep,Read,Write' variable
   local -a clean_env=(env)
-  local -a command=(
+  local -a command
+
+  if [[ "$ROLE" == finder ]]; then tool_names='Glob,Grep,Read'; fi
+  command=(
     claude
     -p
     --model "$MODEL"
     --permission-mode dontAsk
     --no-session-persistence
     --add-dir /
-    --tools 'Bash,Edit,Glob,Grep,Read,Write'
-    --allowed-tools 'Bash,Edit,Glob,Grep,Read,Write'
+    --tools "$tool_names"
+    --allowed-tools "$tool_names"
   )
 
   if [[ "$EFFORT_OR_VARIANT" != default ]]; then
@@ -1106,13 +1170,16 @@ run_claude() {
 }
 
 run_pi() {
-  local status
-  local -a command=(
+  local status tool_names=read,grep,find,ls,bash,edit,write
+  local -a command
+
+  if [[ "$ROLE" == finder ]]; then tool_names=read,grep,find,ls; fi
+  command=(
     pi -p
     --provider "$PROVIDER"
     --model "$MODEL"
     --no-session
-    --tools read,grep,find,ls,bash,edit,write
+    --tools "$tool_names"
     --no-skills
     --no-prompt-templates
     --no-approve
@@ -1327,8 +1394,8 @@ run_selected_agent() {
 }
 
 run_oracle_group() {
-  local index status label successes=0
-  local -a response_files=() error_files=() child_pids=() child_statuses=()
+  local index status successes=0
+  local -a response_files=() error_files=() child_statuses=()
 
   for index in "${!reviewer_specs[@]}"; do
     response_files[index]="$(mktemp "$STATE_PATH/.$ROLE.reviewer-response.XXXXXX")"
@@ -1339,6 +1406,9 @@ run_oracle_group() {
     chmod 600 "${error_files[index]}"
   done
 
+  reviewer_child_pids=()
+  # Separate reviewer process groups let the launcher reap native descendants on termination.
+  set -m
   for index in "${!reviewer_specs[@]}"; do
     (
       child_temporary_start=${#temporary_files[@]}
@@ -1346,15 +1416,17 @@ run_oracle_group() {
       parse_agent_spec "${reviewer_specs[index]}"
       run_selected_agent
     ) >"${response_files[index]}" 2>"${error_files[index]}" &
-    child_pids[index]=$!
+    reviewer_child_pids[index]=$!
   done
+  set +m
 
-  for index in "${!child_pids[@]}"; do
-    if wait "${child_pids[index]}"; then
+  for index in "${!reviewer_child_pids[@]}"; do
+    if wait "${reviewer_child_pids[index]}"; then
       status=0
     else
       status=$?
     fi
+    reviewer_child_pids[index]=''
     if (( status == 0 )) && ! grep -q '[^[:space:]]' "${response_files[index]}"; then
       printf '%s: reviewer %s completed without a final response\n' \
         "$ROLE" "$((index + 1))" >>"${error_files[index]}"
@@ -1367,24 +1439,26 @@ run_oracle_group() {
   printf 'Reviewer roster (launcher-authored; reviewer bodies may contain arbitrary headings):\n' \
     >>"$RESPONSE_FILE"
   for index in "${!reviewer_specs[@]}"; do
-    printf '%s. %s\n' "$((index + 1))" "${reviewer_specs[index]}" >>"$RESPONSE_FILE"
+    printf '%s. Reviewer %s\n' "$((index + 1))" "$((index + 1))" >>"$RESPONSE_FILE"
   done
   printf '\n' >>"$RESPONSE_FILE"
 
   for index in "${!reviewer_specs[@]}"; do
     status=${child_statuses[index]}
-    label=${reviewer_specs[index]}
-    printf '## Reviewer %s — %s\n\n' "$((index + 1))" "$label" >>"$RESPONSE_FILE"
+    printf '## Reviewer %s\n\n' "$((index + 1))" >>"$RESPONSE_FILE"
     if (( status == 0 )); then
       successes=$((successes + 1))
       print_file_with_newline "${response_files[index]}" >>"$RESPONSE_FILE"
     else
-      printf 'Failed: reviewer exited %s. Diagnostics: %s\n' "$status" "$RUN_LOG" >>"$RESPONSE_FILE"
-      printf '%s: reviewer %s (%s) exited %s\n' \
-        "$ROLE" "$((index + 1))" "$label" "$status" >&2
+      if [[ "$mode" == detached ]]; then
+        printf 'Failed: reviewer exited %s. Diagnostics: %s\n' "$status" "$RUN_LOG" >>"$RESPONSE_FILE"
+      else
+        printf 'Failed: reviewer exited %s.\n' "$status" >>"$RESPONSE_FILE"
+      fi
+      printf '%s: reviewer %s exited %s\n' "$ROLE" "$((index + 1))" "$status" >&2
     fi
     if [[ -s "${error_files[index]}" ]]; then
-      printf '%s: reviewer %s (%s) diagnostics:\n' "$ROLE" "$((index + 1))" "$label" >&2
+      printf '%s: reviewer %s diagnostics:\n' "$ROLE" "$((index + 1))" >&2
       print_file_with_newline "${error_files[index]}" >&2
     fi
     if (( index + 1 < reviewer_count )); then
@@ -1439,7 +1513,13 @@ fi
 
 response_row_status=0
 if [[ "$mode" == blocking ]]; then
-  response_title="$(title_with_spec "$ROLE_ACTIVITY_TITLE response")"
+  response_title="$ROLE_ACTIVITY_TITLE response"
+  if [[ "$run_outcome" == partial ]]; then
+    response_title+=" ($reviewer_success_count of $reviewer_count reviewers)"
+  elif [[ -n "$group_title_detail" ]]; then
+    response_title+=" ($group_title_detail)"
+  fi
+  response_title="$(title_with_spec "$response_title")"
   add_transcript_rows "$response_title" "$RESPONSE_FILE" \
     || response_row_status=$?
 fi

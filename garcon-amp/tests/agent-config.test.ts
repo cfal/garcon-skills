@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import {
   canonicalAgentSpec,
+  canonicalAgentSpecList,
   levelFor,
   parseAgentSpec,
+  parseAgentSpecList,
   providerFor,
   ROLE_NAMES,
 } from '../lib/agent-config.ts';
@@ -68,6 +70,23 @@ describe('agent specifications', () => {
     }
   });
 
+  test('parses canonical agent-spec lists without reordering reviewers', () => {
+    const value = 'claude:opus-5:high,codex:gpt-5.6-sol:max,pi:openai:model:low';
+    const configs = parseAgentSpecList(value);
+
+    expect(configs.map(({ agent }) => agent)).toEqual(['claude', 'codex', 'pi']);
+    expect(canonicalAgentSpecList(configs)).toBe(value);
+    for (const invalid of [
+      '',
+      'codex:model:high,',
+      ',codex:model:high',
+      'codex:model:high,,claude:model:low',
+      'codex:model:high,codex:model:high',
+    ]) {
+      expect(() => parseAgentSpecList(invalid)).toThrow();
+    }
+  });
+
   test('rejects malformed specifications', () => {
     const invalid = [
       '',
@@ -78,6 +97,7 @@ describe('agent specifications', () => {
       'codex::max',
       'codex:model:off',
       'codex:model\nname:max',
+      'codex:model,name:max',
       'claude:model',
       'claude:model:max:extra',
       'claude::max',

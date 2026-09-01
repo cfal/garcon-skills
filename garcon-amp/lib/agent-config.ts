@@ -17,7 +17,7 @@ export type AgentConfig =
   | { agent: 'opencode'; provider: string; model: string; variant: string };
 
 function assertValue(kind: string, value: string) {
-  if (!value || /[:\u0000\r\n]/.test(value)) throw new Error(`invalid ${kind}`);
+  if (!value || /[:,\u0000\r\n]/.test(value)) throw new Error(`invalid ${kind}`);
 }
 
 function assertProvider(provider: string) {
@@ -79,6 +79,24 @@ export function canonicalAgentSpec(config: AgentConfig) {
     case 'opencode':
       return `${config.agent}:${config.provider}:${config.model}:${config.variant}`;
   }
+}
+
+export function parseAgentSpecList(value: string) {
+  const specs = value.split(',');
+  if (specs.some((spec) => spec === '')) {
+    throw new Error('agent spec list contains an empty entry');
+  }
+
+  const configs = specs.map(parseAgentSpec);
+  const canonicalSpecs = configs.map(canonicalAgentSpec);
+  if (new Set(canonicalSpecs).size !== canonicalSpecs.length) {
+    throw new Error('agent spec list contains a duplicate');
+  }
+  return configs;
+}
+
+export function canonicalAgentSpecList(configs: readonly AgentConfig[]) {
+  return configs.map(canonicalAgentSpec).join(',');
 }
 
 export function providerFor(config: AgentConfig) {

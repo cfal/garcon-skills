@@ -15,7 +15,9 @@ import {
 } from 'node:fs/promises';
 import {
   canonicalAgentSpec,
+  canonicalAgentSpecList,
   parseAgentSpec,
+  parseAgentSpecList,
   ROLE_NAMES,
 } from './lib/agent-config.ts';
 import {
@@ -65,7 +67,7 @@ Options:
                            before explicit overrides
 
 Role options:
-  --oracle <agent-spec>
+  --oracle <agent-spec>     Repeat to configure multiple default Oracle reviewers
   --finder <agent-spec>
   --librarian <agent-spec>
   --reporter <agent-spec>
@@ -88,9 +90,10 @@ User role-default file:
   $HOME/.config/garcon-amp.conf
 
 Setup creates this file with the bundled defaults when it is missing. Each
-nonblank line is <specialist-role>=<agent-spec>. Explicit role options override
-file defaults. Established role selections remain preserved until explicitly
-changed or reapplied with --reset-defaults.
+nonblank line is <specialist-role>=<agent-spec>. Oracle may use a comma-separated
+list; other roles take one spec. Explicit role options override file defaults.
+Established role selections remain preserved until explicitly changed or
+reapplied with --reset-defaults.
 
 Every successful rerun validates the installation, publishes a re-initialized
 notice in the selected chat, and reprints its complete runtime instruction packet.
@@ -136,11 +139,14 @@ function parseRoleAssignments(content, filePath, { requireAll = false, kind = 'r
     seen.add(name);
     let parsed;
     try {
-      parsed = parseAgentSpec(spec);
+      parsed = parseAgentSpecList(spec);
+      if (name !== 'oracle' && parsed.length !== 1) {
+        throw new Error('only oracle may configure multiple agent specs');
+      }
     } catch (error) {
       fail(`invalid ${name} ${kind} at ${filePath}:${index + 1}: ${error.message}`);
     }
-    specs[name] = canonicalAgentSpec(parsed);
+    specs[name] = canonicalAgentSpecList(parsed);
   }
   if (requireAll) {
     for (const role of ROLE_NAMES) {
@@ -210,7 +216,7 @@ function renderRoleAssignments(specs) {
 
 function renderRoleConfig(roles) {
   return renderRoleAssignments(Object.fromEntries(
-    roles.map((role) => [role.name, canonicalAgentSpec(role.config)]),
+    roles.map((role) => [role.name, canonicalAgentSpecList(role.configs)]),
   ));
 }
 
@@ -390,7 +396,7 @@ function parseOptions(args) {
   for (let index = 1; index < args.length;) {
     const option = args[index];
     if (!option?.startsWith('--')) fail(usage);
-    if (seen.has(option)) fail(`duplicate option: ${option}`);
+    if (option !== '--oracle' && seen.has(option)) fail(`duplicate option: ${option}`);
     seen.add(option);
 
     if (option === '--reset-defaults') {
@@ -416,7 +422,8 @@ function parseOptions(args) {
 
     const role = option.slice(2);
     if (!ROLE_NAMES.includes(role)) fail(`unknown option: ${option}`);
-    roleSpecs[role] = value;
+    roleSpecs[role] ??= [];
+    roleSpecs[role].push(value);
     index += 2;
   }
 
@@ -483,6 +490,7 @@ async function resolveSharedSandbox(directory, recovery) {
 }
 
 function openCodeConfig(agentName, role) {
+  const editAndBashPermission = role === 'finder' ? 'deny' : 'allow';
   return JSON.stringify({
     share: 'disabled',
     subagent_depth: 0,
@@ -493,8 +501,8 @@ function openCodeConfig(agentName, role) {
         permission: {
           '*': 'deny',
           read: 'allow',
-          edit: 'allow',
-          bash: 'allow',
+          edit: editAndBashPermission,
+          bash: editAndBashPermission,
           glob: 'allow',
           grep: 'allow',
           list: 'allow',
@@ -533,19 +541,30 @@ const selectedGarconCliExecutable = requestedGarconPath === undefined
   : undefined;
 
 const roles = ROLE_NAMES.map((name) => {
-  let config;
+  let configs;
   try {
-    const spec = roleSpecs[name]
-      ?? (resetDefaults
+    const explicitSpecs = roleSpecs[name];
+    if (explicitSpecs !== undefined) {
+      configs = explicitSpecs.map(parseAgentSpec);
+      const canonicalSpecs = configs.map(canonicalAgentSpec);
+      if (new Set(canonicalSpecs).size !== canonicalSpecs.length) {
+        throw new Error('agent spec list contains a duplicate');
+      }
+    } else {
+      const spec = (resetDefaults
         ? undefined
         : existingRoleConfig?.specs[name])
-      ?? userRoleDefaults.specs[name]
-      ?? bundledRoleDefaults[name];
-    config = parseAgentSpec(spec);
+        ?? userRoleDefaults.specs[name]
+        ?? bundledRoleDefaults[name];
+      configs = parseAgentSpecList(spec);
+    }
+    if (name !== 'oracle' && configs.length !== 1) {
+      throw new Error('only oracle may configure multiple agent specs');
+    }
   } catch (error) {
     fail(`invalid ${name} agent spec: ${error.message}`);
   }
-  return { name, ...roleDefinitions[name], config };
+  return { name, ...roleDefinitions[name], configs };
 });
 
 let garconCli;
@@ -595,7 +614,11 @@ if (requestedSharedSandbox === undefined && selectedSandboxPath !== defaultSandb
   );
 }
 
-for (const binary of new Set(['bun', 'setsid', ...roles.map((role) => role.config.agent)])) {
+for (const binary of new Set([
+  'bun',
+  'setsid',
+  ...roles.flatMap((role) => role.configs.map((config) => config.agent)),
+])) {
   if (!Bun.which(binary)) fail(`required selected executable is not on PATH: ${binary}`);
 }
 
