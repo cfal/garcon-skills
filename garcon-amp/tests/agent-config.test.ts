@@ -5,7 +5,11 @@ import {
   levelFor,
   parseAgentSpec,
   parseAgentSpecList,
+  parseAgentSpecWithAliases,
+  parseSpecAliasName,
+  parseSpecAliasTarget,
   providerFor,
+  resolveAgentSpecAlias,
   ROLE_NAMES,
 } from '../lib/agent-config.ts';
 
@@ -120,5 +124,58 @@ describe('agent specifications', () => {
     for (const spec of invalid) {
       expect(() => parseAgentSpec(spec)).toThrow();
     }
+  });
+
+  test('validates and resolves single-pass spec aliases', () => {
+    const aliases = new Map([
+      ['k3', 'opencode:moonshotai:kimi-k3:high'],
+      ['glm-5.3', 'opencode:zhipuai-coding-plan:glm-5.3'],
+      ['nested', 'k3'],
+    ]);
+
+    expect(parseSpecAliasName('GLM_5.3-fast')).toBe('GLM_5.3-fast');
+    for (const name of ['', '.hidden', 'contains space', 'codex', 'claude', 'pi', 'opencode']) {
+      expect(() => parseSpecAliasName(name)).toThrow();
+    }
+
+    for (const target of [
+      'codex:model',
+      'codex:model:high',
+      'claude:model',
+      'claude:model:xhigh',
+      'pi:provider:model',
+      'pi:provider:model:high',
+      'opencode:provider:model',
+      'opencode:provider:model:fast',
+    ]) {
+      expect(parseSpecAliasTarget(target)).toBe(target);
+    }
+    for (const target of [
+      '',
+      'k3',
+      'k3:high',
+      'codex',
+      'codex:model:invalid',
+      'pi:provider',
+      'pi:bad provider:model',
+      'opencode:provider:model:variant:extra',
+    ]) {
+      expect(() => parseSpecAliasTarget(target)).toThrow();
+    }
+
+    expect(resolveAgentSpecAlias('k3', aliases)).toBe('opencode:moonshotai:kimi-k3:high');
+    expect(resolveAgentSpecAlias('glm-5.3:max', aliases))
+      .toBe('opencode:zhipuai-coding-plan:glm-5.3:max');
+    expect(resolveAgentSpecAlias('GLM-5.3:max', aliases)).toBe('GLM-5.3:max');
+    expect(resolveAgentSpecAlias('glm-5.3-extra:max', aliases)).toBe('glm-5.3-extra:max');
+    expect(() => parseAgentSpecWithAliases('nested:high', aliases)).toThrow(
+      'alias "nested" resolved to "k3:high"',
+    );
+    expect(canonicalAgentSpec(parseAgentSpecWithAliases('glm-5.3:max', aliases)))
+      .toBe('opencode:zhipuai-coding-plan:glm-5.3:max');
+    expect(() => parseAgentSpecList(
+      'k3,opencode:moonshotai:kimi-k3:high',
+      aliases,
+    )).toThrow('duplicate after alias resolution');
   });
 });

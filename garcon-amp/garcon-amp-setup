@@ -16,8 +16,10 @@ import {
 import {
   canonicalAgentSpec,
   canonicalAgentSpecList,
-  parseAgentSpec,
   parseAgentSpecList,
+  parseAgentSpecWithAliases,
+  parseSpecAliasName,
+  parseSpecAliasTarget,
   ROLE_NAMES,
 } from './lib/agent-config.ts';
 import {
@@ -29,16 +31,19 @@ import {
 } from './lib/garcon-path.ts';
 
 const skillPath = path.dirname(fileURLToPath(import.meta.url));
+const defaultProfileName = 'default';
 const bundledRoleDefaultsPath = path.join(skillPath, 'defaults.conf');
 const bundledRoleDefaultsSource = await requireBundledFile(
   bundledRoleDefaultsPath,
   'role defaults file',
 );
-const bundledRoleDefaults = parseRoleAssignments(
+const bundledDefaults = parseConfigAssignments(
   bundledRoleDefaultsSource,
   bundledRoleDefaultsPath,
-  { requireAll: true, kind: 'bundled role default' },
+  { allowProfiles: true, requireAll: true, kind: 'bundled role default' },
 );
+const bundledRoleDefaults = bundledDefaults.specs;
+const bundledProfiles = bundledDefaults.profiles;
 const bundledRoleDefaultsContent = renderRoleAssignments(bundledRoleDefaults);
 
 const roleDefinitions = {
@@ -63,14 +68,16 @@ Options:
                            (created recursively when missing)
                            (existing selection is tightened to 0700)
                            (first-run default: /tmp/garcon-amp-<chat-id>/sandbox)
-  --reset-defaults        Reset roles to configured defaults and reset sandbox
+  --profile <name>        Select a complete named role profile for this chat
+                           (default selects the unprefixed role assignments)
+  --reset-defaults        Reset roles to the default profile and reset sandbox
                            before explicit overrides
 
 Role options:
-  --oracle <agent-spec>     Repeat to configure multiple default Oracle reviewers
-  --finder <agent-spec>
-  --librarian <agent-spec>
-  --reporter <agent-spec>
+  --oracle <spec-or-alias>     Repeat to configure multiple default Oracle reviewers
+  --finder <spec-or-alias>
+  --librarian <spec-or-alias>
+  --reporter <spec-or-alias>
 
 Agent specs:
   codex:<model>:<effort>
@@ -86,19 +93,32 @@ Bundled defaults (defaults.conf):
   librarian=${bundledRoleDefaults.librarian}
   reporter=${bundledRoleDefaults.reporter}
 
-User role-default file:
+User profile/default file:
   $HOME/.config/garcon-amp.conf
 
-Setup creates this file with the bundled defaults when it is missing. Each
-nonblank line is <specialist-role>=<agent-spec>. Oracle may use a comma-separated
-list; other roles take one spec. Explicit role options override file defaults.
-Established role selections remain preserved until explicitly changed or
-reapplied with --reset-defaults.
+Setup creates this file with the bundled defaults when it is missing. Role lines
+use <specialist-role>=<spec-or-alias> for the default profile. Named profiles use
+exactly this five-line form, with no blank or unrelated lines inside the block:
+
+  [profile:<name>]
+  oracle=<spec-or-alias>
+  finder=<spec-or-alias>
+  librarian=<spec-or-alias>
+  reporter=<spec-or-alias>
+
+Parsing resumes normally after reporter. default is reserved for the unprefixed
+assignments. Names match [A-Za-z0-9][A-Za-z0-9._-]* and are case-sensitive; a
+complete user profile replaces a packaged namesake as a whole. Oracle may use a
+comma-separated list. Alias lines use
+spec-alias:<name>=<agent-spec-prefix>; a target may omit only its final level.
+Aliases expand one exact first segment, once. --profile replaces the whole role
+bundle, then explicit role options override it. Established resolved roles remain
+preserved until explicitly changed, reselected, or reset to the default profile.
 
 Every successful rerun validates the installation, publishes a re-initialized
 notice in the selected chat, and reprints its complete runtime instruction packet.
-The notice shows the complete current role config when it changed; otherwise it
-says No changes.`;
+The notice shows the complete current role config when it changed, Spec aliases
+changed for an alias-only update, and No changes otherwise.`;
 
 const instructionsFileName = 'INSTRUCTIONS.md';
 const instructionsBeginMarker = 'GARCON-AMP INSTRUCTIONS BEGIN';
@@ -110,6 +130,7 @@ const initializationNoticeTitle = 'Garcon-Amp initialized';
 const reinitializationNoticeTitle = 'Garcon-Amp re-initialized';
 const roleDefaultsCreationNotice = 'Created $HOME/.config/garcon-amp.conf with defaults';
 const noRoleChangesNotice = 'No changes';
+const specAliasesChangedNotice = 'Spec aliases changed';
 
 function fail(message) {
   console.error(`garcon-amp-setup: ${message}`);
@@ -120,40 +141,201 @@ function shellQuote(value) {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-function parseRoleAssignments(content, filePath, { requireAll = false, kind = 'role default' } = {}) {
+function parseProfileName(name) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+    throw new Error(`invalid profile name: ${name || '<empty>'}`);
+  }
+  return name;
+}
+
+function normalizeConfigLine(line) {
+  return line.endsWith('\r') ? line.slice(0, -1) : line;
+}
+
+function parseRawProfileBlock(lines, headerIndex, profileName, filePath, kind) {
+  const assignments = {};
+  for (const [roleIndex, role] of ROLE_NAMES.entries()) {
+    const index = headerIndex + roleIndex + 1;
+    const line = lines[index] ?? '';
+    const prefix = `${role}=`;
+    if (!line.startsWith(prefix) || line.length === prefix.length) {
+      fail(
+        `invalid profile "${profileName}" in ${kind} at ${filePath}:${index + 1}; `
+        + `expected ${role}=<spec>`,
+      );
+    }
+    assignments[role] = { spec: line.slice(prefix.length), line: index + 1 };
+  }
+  return assignments;
+}
+
+function parseRawRoleAssignments(
+  rawSpecs,
+  filePath,
+  {
+    aliases,
+    requireAll,
+    resolveAliases,
+    kind,
+    profileName,
+  },
+) {
   const specs = {};
+  const profileContext = profileName === undefined ? '' : ` in profile "${profileName}"`;
+  for (const name of ROLE_NAMES) {
+    const assignment = rawSpecs[name];
+    if (assignment === undefined) continue;
+    let parsed;
+    try {
+      parsed = parseAgentSpecList(
+        assignment.spec,
+        resolveAliases ? aliases : undefined,
+      );
+      if (name !== 'oracle' && parsed.length !== 1) {
+        throw new Error('only oracle may configure multiple agent specs');
+      }
+    } catch (error) {
+      fail(
+        `invalid ${name} ${kind}${profileContext} `
+        + `at ${filePath}:${assignment.line}: ${error.message}`,
+      );
+    }
+    specs[name] = canonicalAgentSpecList(parsed);
+  }
+  if (requireAll) {
+    for (const role of ROLE_NAMES) {
+      if (specs[role] === undefined) {
+        fail(`${kind}${profileContext} is missing ${role}: ${filePath}`);
+      }
+    }
+  }
+  return specs;
+}
+
+function parseConfigAssignments(
+  content,
+  filePath,
+  {
+    allowAliases = false,
+    allowBaseProfile = false,
+    allowProfiles = false,
+    requireAll = false,
+    resolveAliases = false,
+    kind = 'role default',
+  } = {},
+) {
+  const aliases = new Map();
+  const rawSpecs = {};
+  const rawProfiles = new Map();
   const seen = new Set();
-  for (const [index, rawLine] of content.split('\n').entries()) {
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+  let baseProfile;
+  const lines = content.split('\n').map(normalizeConfigLine);
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
     if (!line.trim()) continue;
+
+    if (line.startsWith('[profile:')) {
+      if (!allowProfiles) {
+        fail(`profile sections are not allowed in ${kind} at ${filePath}:${index + 1}`);
+      }
+      const match = /^\[profile:(\S+)\]$/.exec(line);
+      if (match === null) {
+        fail(`invalid profile header at ${filePath}:${index + 1}; expected [profile:<name>]`);
+      }
+      let profileName;
+      try {
+        profileName = parseProfileName(match[1]);
+      } catch (error) {
+        fail(`invalid profile header at ${filePath}:${index + 1}: ${error.message}`);
+      }
+      if (profileName === defaultProfileName) {
+        fail(
+          `invalid profile header at ${filePath}:${index + 1}: `
+          + 'the default profile must use unprefixed role assignments',
+        );
+      }
+      if (rawProfiles.has(profileName)) {
+        fail(`duplicate profile "${profileName}" at ${filePath}:${index + 1}`);
+      }
+      rawProfiles.set(
+        profileName,
+        parseRawProfileBlock(lines, index, profileName, filePath, kind),
+      );
+      index += ROLE_NAMES.length;
+      continue;
+    }
+
     const separator = line.indexOf('=');
     if (separator <= 0 || separator === line.length - 1) {
       fail(`invalid ${kind} at ${filePath}:${index + 1}; expected <specialist-role>=<spec>`);
     }
-    const name = line.slice(0, separator);
+    const assignment = line.slice(0, separator);
+    if (assignment.startsWith('spec-alias:')) {
+      if (!allowAliases) {
+        fail(`unknown specialist role in ${kind} at ${filePath}:${index + 1}: ${assignment}`);
+      }
+      const rawName = assignment.slice('spec-alias:'.length);
+      const name = rawName.replace(/[\t ]+$/, '');
+      const target = line.slice(separator + 1).replace(/^[\t ]+|[\t ]+$/g, '');
+      try {
+        parseSpecAliasName(name);
+        if (aliases.has(name)) throw new Error(`duplicate spec alias: ${name}`);
+        aliases.set(name, parseSpecAliasTarget(target));
+      } catch (error) {
+        fail(`invalid spec alias at ${filePath}:${index + 1}: ${error.message}`);
+      }
+      continue;
+    }
+
+    if (assignment === 'base-profile') {
+      if (!allowBaseProfile) {
+        fail(`unknown specialist role in ${kind} at ${filePath}:${index + 1}: ${assignment}`);
+      }
+      if (baseProfile !== undefined) {
+        fail(`duplicate base profile in ${kind} at ${filePath}:${index + 1}`);
+      }
+      try {
+        baseProfile = parseProfileName(line.slice(separator + 1));
+      } catch (error) {
+        fail(`invalid base profile in ${kind} at ${filePath}:${index + 1}: ${error.message}`);
+      }
+      if (baseProfile === defaultProfileName) {
+        fail(`invalid base profile in ${kind} at ${filePath}:${index + 1}: default must be omitted`);
+      }
+      continue;
+    }
+
+    if (assignment.startsWith('profile:')) {
+      fail(
+        `invalid profile syntax at ${filePath}:${index + 1}; `
+        + 'use [profile:<name>] followed by oracle, finder, librarian, and reporter assignments',
+      );
+    }
+
+    const name = assignment;
     const spec = line.slice(separator + 1);
     if (!ROLE_NAMES.includes(name)) {
       fail(`unknown specialist role in ${kind} at ${filePath}:${index + 1}: ${name}`);
     }
     if (seen.has(name)) fail(`duplicate ${name} ${kind} at ${filePath}:${index + 1}`);
     seen.add(name);
-    let parsed;
-    try {
-      parsed = parseAgentSpecList(spec);
-      if (name !== 'oracle' && parsed.length !== 1) {
-        throw new Error('only oracle may configure multiple agent specs');
-      }
-    } catch (error) {
-      fail(`invalid ${name} ${kind} at ${filePath}:${index + 1}: ${error.message}`);
-    }
-    specs[name] = canonicalAgentSpecList(parsed);
+    rawSpecs[name] = { spec, line: index + 1 };
   }
-  if (requireAll) {
-    for (const role of ROLE_NAMES) {
-      if (specs[role] === undefined) fail(`${kind} is missing ${role}: ${filePath}`);
-    }
+
+  const parseOptions = { aliases, kind, resolveAliases };
+  const specs = parseRawRoleAssignments(rawSpecs, filePath, {
+    ...parseOptions,
+    requireAll,
+  });
+  const profiles = new Map();
+  for (const [profileName, assignments] of rawProfiles) {
+    profiles.set(profileName, parseRawRoleAssignments(assignments, filePath, {
+      ...parseOptions,
+      profileName,
+      requireAll: true,
+    }));
   }
-  return specs;
+  return { aliases, baseProfile, profiles, specs };
 }
 
 async function readUserRoleDefaults() {
@@ -161,19 +343,46 @@ async function readUserRoleDefaults() {
   if (!home) fail('HOME is not set; cannot resolve role defaults file');
   const defaultsPath = path.join(home, '.config', 'garcon-amp.conf');
   const info = await requireOwnedRegularFileIfPresent(defaultsPath, 'role defaults file');
-  if (!info) return { specs: {}, path: defaultsPath, shouldCreate: true, home };
+  if (!info) {
+    return {
+      aliases: new Map(),
+      profiles: new Map(),
+      specs: {},
+      path: defaultsPath,
+      shouldCreate: true,
+      home,
+    };
+  }
   let content;
   try {
     content = await readFile(defaultsPath, 'utf8');
   } catch (error) {
     fail(`cannot read role defaults file: ${defaultsPath}: ${error.message}`);
   }
+  const parsed = parseConfigAssignments(content, defaultsPath, {
+    allowAliases: true,
+    allowProfiles: true,
+    resolveAliases: true,
+  });
   return {
-    specs: parseRoleAssignments(content, defaultsPath),
+    ...parsed,
     path: defaultsPath,
     shouldCreate: false,
     home,
   };
+}
+
+function resolveProfileSpecs(profileName, userDefaults) {
+  if (profileName === defaultProfileName) {
+    return Object.fromEntries(ROLE_NAMES.map((name) => [
+      name,
+      userDefaults.specs[name] ?? bundledRoleDefaults[name],
+    ]));
+  }
+
+  const specs = userDefaults.profiles.get(profileName) ?? bundledProfiles.get(profileName);
+  if (specs === undefined) fail(`unknown profile: ${profileName}`);
+  return specs;
 }
 
 async function createBundledRoleDefaults(defaultsPath) {
@@ -214,10 +423,32 @@ function renderRoleAssignments(specs) {
   return `${ROLE_NAMES.map((name) => `${name}=${specs[name]}`).join('\n')}\n`;
 }
 
+function renderSpecAliases(aliases) {
+  if (aliases.size === 0) return '';
+  const entries = [...aliases].sort(([left], [right]) => {
+    if (left < right) return -1;
+    if (left > right) return 1;
+    return 0;
+  });
+  return `${entries.map(([name, target]) => `spec-alias:${name}=${target}`).join('\n')}\n`;
+}
+
 function renderRoleConfig(roles) {
   return renderRoleAssignments(Object.fromEntries(
     roles.map((role) => [role.name, canonicalAgentSpecList(role.configs)]),
   ));
+}
+
+function renderBaseProfile(profileName) {
+  return profileName === defaultProfileName ? '' : `base-profile=${profileName}\n`;
+}
+
+function renderActiveSelection(roles, profileName) {
+  return `${renderBaseProfile(profileName)}${renderRoleConfig(roles)}`;
+}
+
+function renderActiveConfig(roles, aliases, profileName) {
+  return `${renderActiveSelection(roles, profileName)}${renderSpecAliases(aliases)}`;
 }
 
 async function readActiveRoleConfig(filePath) {
@@ -229,12 +460,14 @@ async function readActiveRoleConfig(filePath) {
   } catch (error) {
     fail(`cannot read active role config: ${filePath}: ${error.message}`);
   }
-  const specs = parseRoleAssignments(content, filePath, {
+  const config = parseConfigAssignments(content, filePath, {
+    allowAliases: true,
+    allowBaseProfile: true,
     requireAll: true,
     kind: 'active role config',
   });
   if ((info.mode & 0o777) !== 0o600) await chmod(filePath, 0o600);
-  return { specs };
+  return config;
 }
 
 async function lstatIfPresent(filePath) {
@@ -390,6 +623,7 @@ function parseOptions(args) {
   const seen = new Set();
   const roleSpecs = {};
   let requestedGarconPath;
+  let requestedProfile;
   let requestedSharedSandbox;
   let resetDefaults = false;
 
@@ -420,6 +654,16 @@ function parseOptions(args) {
       continue;
     }
 
+    if (option === '--profile') {
+      try {
+        requestedProfile = parseProfileName(value);
+      } catch (error) {
+        fail(error.message);
+      }
+      index += 2;
+      continue;
+    }
+
     const role = option.slice(2);
     if (!ROLE_NAMES.includes(role)) fail(`unknown option: ${option}`);
     roleSpecs[role] ??= [];
@@ -430,6 +674,7 @@ function parseOptions(args) {
   return {
     chatId,
     requestedGarconPath,
+    requestedProfile,
     requestedSharedSandbox,
     roleSpecs,
     resetDefaults,
@@ -520,6 +765,7 @@ function openCodeConfig(agentName, role) {
 const {
   chatId,
   requestedGarconPath,
+  requestedProfile,
   requestedSharedSandbox,
   roleSpecs,
   resetDefaults,
@@ -540,22 +786,32 @@ const selectedGarconCliExecutable = requestedGarconPath === undefined
   ? existingInstallation?.garconCliExecutable
   : undefined;
 
+const shouldApplyProfile = requestedProfile !== undefined
+  || resetDefaults
+  || existingRoleConfig === undefined;
+const selectedProfileName = shouldApplyProfile
+  ? requestedProfile ?? defaultProfileName
+  : existingRoleConfig.baseProfile ?? defaultProfileName;
+const selectedProfileSpecs = shouldApplyProfile
+  ? resolveProfileSpecs(selectedProfileName, userRoleDefaults)
+  : undefined;
+
 const roles = ROLE_NAMES.map((name) => {
   let configs;
   try {
     const explicitSpecs = roleSpecs[name];
     if (explicitSpecs !== undefined) {
-      configs = explicitSpecs.map(parseAgentSpec);
+      configs = explicitSpecs.map((spec) => parseAgentSpecWithAliases(
+        spec,
+        userRoleDefaults.aliases,
+      ));
       const canonicalSpecs = configs.map(canonicalAgentSpec);
       if (new Set(canonicalSpecs).size !== canonicalSpecs.length) {
-        throw new Error('agent spec list contains a duplicate');
+        const changed = explicitSpecs.some((spec, index) => spec !== canonicalSpecs[index]);
+        throw new Error(`agent spec list contains a duplicate${changed ? ' after alias resolution' : ''}`);
       }
     } else {
-      const spec = (resetDefaults
-        ? undefined
-        : existingRoleConfig?.specs[name])
-        ?? userRoleDefaults.specs[name]
-        ?? bundledRoleDefaults[name];
+      const spec = selectedProfileSpecs?.[name] ?? existingRoleConfig.specs[name];
       configs = parseAgentSpecList(spec);
     }
     if (name !== 'oracle' && configs.length !== 1) {
@@ -717,13 +973,30 @@ generatedArtifacts.push({
   kind: 'generated instruction file',
 });
 
-const activeRoleConfig = renderRoleConfig(roles);
+const activeRoleAssignments = renderRoleConfig(roles);
+const activeSelection = renderActiveSelection(roles, selectedProfileName);
+const activeRoleConfig = renderActiveConfig(
+  roles,
+  userRoleDefaults.aliases,
+  selectedProfileName,
+);
 const roleConfigChanged = existingRoleConfig === undefined
-  || activeRoleConfig !== renderRoleAssignments(existingRoleConfig.specs);
+  || activeRoleAssignments !== renderRoleAssignments(existingRoleConfig.specs);
+const profileChanged = existingRoleConfig !== undefined
+  && selectedProfileName !== (existingRoleConfig.baseProfile ?? defaultProfileName);
+const specAliasesChanged = existingRoleConfig === undefined
+  || renderSpecAliases(userRoleDefaults.aliases) !== renderSpecAliases(existingRoleConfig.aliases);
 const setupNoticeTitle = existingRoleConfig === undefined
   ? initializationNoticeTitle
   : reinitializationNoticeTitle;
-const setupNoticeConfig = roleConfigChanged ? activeRoleConfig : `${noRoleChangesNotice}\n`;
+let setupNoticeConfig;
+if (roleConfigChanged || profileChanged) {
+  setupNoticeConfig = activeSelection;
+} else if (specAliasesChanged) {
+  setupNoticeConfig = `${specAliasesChangedNotice}\n`;
+} else {
+  setupNoticeConfig = `${noRoleChangesNotice}\n`;
+}
 const setupNoticeContent = userRoleDefaults.shouldCreate
   ? `${setupNoticeConfig}\n${roleDefaultsCreationNotice}\n`
   : setupNoticeConfig;

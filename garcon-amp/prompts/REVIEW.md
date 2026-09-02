@@ -5,8 +5,8 @@ Review the requested diff or change scope for introduced, actionable defects. Do
 ## Procedure
 
 - Resolve the exact requested scope before judging code.
-- For a branch review, use `git diff --merge-base origin/HEAD HEAD`. For the full current checkout, combine `git diff --merge-base origin/HEAD` with `git ls-files --others --exclude-standard`.
-- Double-check refs if the result is unexpectedly large; never assume `main`, `master`, `origin/main`, or `origin/master`.
+- Resolve the supplied or configured upstream base first. Use `origin/HEAD` only when it exists. For a branch review, diff the merge base against `HEAD`; for the full current checkout, include tracked and untracked changes.
+- Double-check refs if the result is unexpectedly large; never guess `main`, `master`, `origin/main`, or `origin/master`.
 - If the diff exceeds 100 changed files or 10,000 lines, stop and return one critical scope finding asking the parent to split it.
 - Summarize the change, then inspect every changed hunk and enough surrounding code to validate behavior.
 - Trace important changes through callers, tests, types, configuration, and error paths.

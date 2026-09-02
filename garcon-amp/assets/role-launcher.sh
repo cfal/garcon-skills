@@ -35,15 +35,16 @@ AGENT=''
 PROVIDER=''
 MODEL=''
 EFFORT_OR_VARIANT=''
-WORK_PATH=$GARCON_PATH
+WORK_PATH=$SANDBOX_PATH
+INVOCATION_PATH=''
 CONFIGURED_VALUE=''
 PRIMARY_SPEC=''
 TITLE_SPEC_LABEL=''
 
 usage() {
   if [[ "$ROLE" == oracle ]]; then
-    printf 'Usage: %s [--review] [--no-defaults] [--spec <agent-spec>]... [--] <prompt>\n' "$ROLE" >&2
-    printf '       %s --start [--review] [--no-defaults] [--spec <agent-spec>]... [--] <prompt>\n' "$ROLE" >&2
+    printf 'Usage: %s [--review] [--no-defaults] [--spec <spec-or-alias>]... [--] <prompt>\n' "$ROLE" >&2
+    printf '       %s --start [--review] [--no-defaults] [--spec <spec-or-alias>]... [--] <prompt>\n' "$ROLE" >&2
   elif [[ "$ROLE" == reporter ]]; then
     printf 'Usage: %s <goal>\n' "$ROLE" >&2
     printf '       %s --start <goal>\n' "$ROLE" >&2
@@ -68,6 +69,7 @@ no_defaults=0
 runtime_specs=()
 configured_specs=()
 reviewer_specs=()
+declare -A spec_aliases=()
 reviewer_child_pids=()
 reviewer_count=1
 reviewer_success_count=1
@@ -182,10 +184,8 @@ case "$mode" in
 esac
 
 ROLE_ACTIVITY_TITLE=$ROLE_TITLE
-ROLE_PROVENANCE=$ROLE
 if (( review_mode )); then
   ROLE_ACTIVITY_TITLE="$ROLE_TITLE review"
-  ROLE_PROVENANCE="$ROLE review"
 fi
 
 require_private_directory() {
@@ -199,15 +199,46 @@ require_private_directory() {
 require_private_directory "$STATE_PATH"
 
 load_role_config() {
-  local line spec='' matches=0
+  local line spec='' matches=0 alias_assignment alias_name alias_target
   if [[ ! -f "$CONFIG_PATH" || -L "$CONFIG_PATH" || ! -O "$CONFIG_PATH" || ! -r "$CONFIG_PATH" ]]; then
     printf '%s: unsafe or missing active role config: %s\n' "$ROLE" "$CONFIG_PATH" >&2
     exit 1
   fi
+  spec_aliases=()
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" == "$ROLE="* ]]; then
       matches=$((matches + 1))
       spec="${line#*=}"
+    elif [[ "$line" == spec-alias:* ]]; then
+      alias_assignment=${line#spec-alias:}
+      if [[ "$alias_assignment" != *=* ]]; then
+        printf '%s: invalid active spec alias declaration\n' "$ROLE" >&2
+        exit 1
+      fi
+      alias_name=${alias_assignment%%=*}
+      alias_target=${alias_assignment#*=}
+      if [[ ! "$alias_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        printf '%s: invalid active spec alias name\n' "$ROLE" >&2
+        exit 1
+      fi
+      case "$alias_name" in
+        codex|claude|pi|opencode)
+          printf '%s: reserved active spec alias name: %s\n' "$ROLE" "$alias_name" >&2
+          exit 1
+          ;;
+      esac
+      if [[ -n "${spec_aliases[$alias_name]+present}" ]]; then
+        printf '%s: duplicate active spec alias: %s\n' "$ROLE" "$alias_name" >&2
+        exit 1
+      fi
+      if ! parse_spec_alias_target "$alias_target"; then
+        printf '%s: invalid active spec alias target: %s\n' "$ROLE" "$alias_name" >&2
+        exit 1
+      fi
+      spec_aliases["$alias_name"]=$alias_target
+    elif [[ "$line" == spec-alias* ]]; then
+      printf '%s: invalid active spec alias declaration\n' "$ROLE" >&2
+      exit 1
     fi
   done <"$CONFIG_PATH"
   if (( matches != 1 )) || [[ -z "$spec" ]]; then
@@ -225,7 +256,7 @@ parse_agent_spec() {
   PROVIDER=''
   MODEL=''
   EFFORT_OR_VARIANT=''
-  [[ "$spec" != *,* ]] || return 1
+  [[ "$spec" != *,* && "$spec" != *$'\r'* ]] || return 1
   IFS=: read -r AGENT first second third extra <<<"$spec"
   case "$AGENT" in
     codex)
@@ -269,6 +300,29 @@ parse_agent_spec() {
   [[ "$spec" == "$canonical" ]]
 }
 
+parse_spec_alias_target() {
+  local target=$1
+  [[ "$target" != *,* && "$target" != *$'\r'* ]] || return 1
+  if parse_agent_spec "$target"; then
+    return 0
+  fi
+  if [[ "$target" =~ ^(codex|claude):[^,:]+$ ]]; then
+    return 0
+  fi
+  [[ "$target" =~ ^(pi|opencode):[A-Za-z0-9._-]+:[^,:]+$ ]]
+}
+
+resolve_agent_spec_alias() {
+  local input=$1 name=${1%%:*}
+  RESOLVED_SPEC=$input
+  RESOLVED_ALIAS_NAME=''
+  if [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+    && [[ -n "${spec_aliases[$name]+present}" ]]; then
+    RESOLVED_SPEC="${spec_aliases[$name]}${input:${#name}}"
+    RESOLVED_ALIAS_NAME=$name
+  fi
+}
+
 if [[ "$mode" != status && "$mode" != kill ]]; then
   load_role_config
   if [[ "$ROLE" == oracle ]]; then
@@ -310,14 +364,25 @@ if [[ "$mode" != status && "$mode" != kill ]]; then
   fi
 
   validated_runtime_specs=()
-  for spec in "${runtime_specs[@]}"; do
+  for raw_spec in "${runtime_specs[@]}"; do
+    resolve_agent_spec_alias "$raw_spec"
+    spec=$RESOLVED_SPEC
     if ! parse_agent_spec "$spec"; then
-      printf '%s: invalid --spec agent spec: %s\n' "$ROLE" "$spec" >&2
+      if [[ -n "$RESOLVED_ALIAS_NAME" ]]; then
+        printf '%s: invalid --spec agent spec "%s"; alias "%s" resolved to "%s"\n' \
+          "$ROLE" "$raw_spec" "$RESOLVED_ALIAS_NAME" "$spec" >&2
+      else
+        printf '%s: invalid --spec agent spec: %s\n' "$ROLE" "$spec" >&2
+      fi
       exit 2
     fi
     for selected_spec in "${validated_runtime_specs[@]}"; do
       if [[ "$spec" == "$selected_spec" ]]; then
-        printf '%s: duplicate reviewer agent spec: %s\n' "$ROLE" "$spec" >&2
+        if [[ "$raw_spec" != "$spec" ]]; then
+          printf '%s: duplicate reviewer agent spec after alias resolution: %s\n' "$ROLE" "$spec" >&2
+        else
+          printf '%s: duplicate reviewer agent spec: %s\n' "$ROLE" "$spec" >&2
+        fi
         exit 2
       fi
     done
@@ -334,6 +399,7 @@ if [[ "$mode" != status && "$mode" != kill ]]; then
     fi
     reviewer_specs+=("$spec")
   done
+  runtime_specs=("${validated_runtime_specs[@]}")
 
   if (( ${#reviewer_specs[@]} == 0 )); then
     printf '%s: --no-defaults requires at least one --spec\n' "$ROLE" >&2
@@ -363,6 +429,39 @@ require_private_directory "$SANDBOX_PATH"
 temporary_files=()
 run_owned=0
 killed_by_signal=0
+invocation_path=''
+
+create_invocation_path() {
+  invocation_path="$(mktemp -d "$STATE_PATH/.garcon-amp-launch.XXXXXX")"
+  chmod 700 "$invocation_path"
+  INVOCATION_PATH=$invocation_path
+}
+
+remove_invocation_path() {
+  local candidate=$1 relative
+  if [[ ! -e "$candidate" && ! -L "$candidate" ]]; then
+    return 0
+  fi
+  relative="${candidate#"$STATE_PATH"/}"
+  if [[
+    "$candidate" != "$STATE_PATH"/.garcon-amp-launch.*
+    || "$relative" == */*
+    || ! -d "$candidate"
+    || -L "$candidate"
+    || ! -O "$candidate"
+  ]]; then
+    printf '%s: refusing unsafe launch-directory cleanup path: %s\n' "$ROLE" "$candidate" >&2
+    return 1
+  fi
+  rm -rf -- "$candidate"
+}
+
+cleanup_invocation_path() {
+  [[ -n "$invocation_path" ]] || return 0
+  remove_invocation_path "$invocation_path" || return
+  invocation_path=''
+  INVOCATION_PATH=''
+}
 
 create_reporter_work_path() {
   reporter_work_path="$(mktemp -d "$SANDBOX_PATH/.garcon-amp-reporter.XXXXXX")"
@@ -395,7 +494,7 @@ cleanup_reporter_work_path() {
   [[ -n "$reporter_work_path" ]] || return 0
   remove_reporter_work_path "$reporter_work_path" || return
   reporter_work_path=''
-  WORK_PATH=$GARCON_PATH
+  WORK_PATH=$SANDBOX_PATH
 }
 
 remove_temporary_files_from() {
@@ -409,6 +508,7 @@ remove_temporary_files_from() {
 cleanup() {
   local status=0
   remove_temporary_files_from 0
+  cleanup_invocation_path || status=$?
   cleanup_reporter_work_path || status=$?
   return "$status"
 }
@@ -528,6 +628,13 @@ cleanup_recorded_reporter_work_path() {
   update_run_state 'workPath='
 }
 
+cleanup_recorded_invocation_path() {
+  local candidate=$1
+  [[ -n "$candidate" ]] || return 0
+  remove_invocation_path "$candidate" || return
+  update_run_state 'launchPath='
+}
+
 run_is_alive() {
   local pid=$1
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null
@@ -576,6 +683,7 @@ claim_run() {
     "callback=$claim_callback" \
     "review=$review_mode" \
     "reviewers=$reviewer_count" \
+    'launchPath=' \
     'workPath='
   if ln -- "$temporary" "$RUN_FILE" 2>/dev/null; then
     rm -f -- "$temporary"
@@ -644,6 +752,31 @@ console.log(`${prefix}${displayedSpec}${suffix}`);
 ' "$base" "$TITLE_SPEC_LABEL"
 }
 
+print_callback_result() {
+  local status=$1 bytes=$2 elapsed=$3 run_id=$4
+  printf '<garcon-amp-result agent="%s" ref="%s">\n' "$ROLE" "$run_id"
+  if (( status == 0 )); then
+    print_file_with_newline "$RESPONSE_FILE"
+  else
+    if (( reviewer_count > 1 )); then
+      printf 'Failed: all %s reviewers exited without a result after %s; delegated question unanswered. Diagnostics: %s\n' \
+        "$reviewer_count" "$elapsed" "$RUN_LOG"
+      if (( bytes > 0 )); then
+        printf '\n'
+        print_file_with_newline "$RESPONSE_FILE"
+      fi
+    else
+      printf 'Failed: async %s consultation exited %s after %s; delegated question unanswered. Diagnostics: %s\n' \
+        "$ROLE_ACTIVITY_TITLE" "$status" "$elapsed" "$RUN_LOG"
+    fi
+    if (( reviewer_count == 1 && bytes > 0 )); then
+      printf '\nPartial output (%s bytes; incomplete):\n\n' "$bytes"
+      print_file_with_newline "$RESPONSE_FILE"
+    fi
+  fi
+  printf '</garcon-amp-result>\n'
+}
+
 send_callback() {
   local status=$1 bytes=$2 elapsed run_id output
   local callback_title fallback_title send_status=0 fallback_status=0
@@ -671,35 +804,10 @@ send_callback() {
     --collapsible
     -
   )
-  if (( status == 0 )); then
-    output="$(
-      {
-        printf '[garcon-amp %s result: %s]\n\n' "$ROLE_PROVENANCE" "$run_id"
-        print_file_with_newline "$RESPONSE_FILE"
-      } | (cd "$GARCON_PATH" && "${callback_command[@]}") 2>&1
-    )" || send_status=$?
-  else
-    output="$(
-      {
-        printf '[garcon-amp %s result: %s]\n\n' "$ROLE_PROVENANCE" "$run_id"
-        if (( reviewer_count > 1 )); then
-          printf 'Failed: all %s reviewers exited without a result after %s; delegated question unanswered. Diagnostics: %s\n' \
-            "$reviewer_count" "$elapsed" "$RUN_LOG"
-          if (( bytes > 0 )); then
-            printf '\n'
-            print_file_with_newline "$RESPONSE_FILE"
-          fi
-        else
-          printf 'Failed: async %s consultation exited %s after %s; delegated question unanswered. Diagnostics: %s\n' \
-            "$ROLE_ACTIVITY_TITLE" "$status" "$elapsed" "$RUN_LOG"
-        fi
-        if (( reviewer_count == 1 && bytes > 0 )); then
-          printf '\nPartial output (%s bytes; incomplete):\n\n' "$bytes"
-          print_file_with_newline "$RESPONSE_FILE"
-        fi
-      } | (cd "$GARCON_PATH" && "${callback_command[@]}") 2>&1
-    )" || send_status=$?
-  fi
+  output="$(
+    print_callback_result "$status" "$bytes" "$elapsed" "$run_id" \
+      | (cd "$GARCON_PATH" && "${callback_command[@]}") 2>&1
+  )" || send_status=$?
 
   if (( send_status != 0 )) || [[ "$output" != *"chat id: $CHAT_ID"* ]]; then
     printf '%s: callback delivery failed: %s\n' "$ROLE" "$output" >&2
@@ -735,6 +843,7 @@ finalize_run() {
     "exitCode=$status" \
     "finishedAt=$EPOCHSECONDS" \
     "responseBytes=$bytes" \
+    "launchPath=$invocation_path" \
     "workPath=$reporter_work_path" || return 1
   # A killed run needs no callback: whoever signalled it already knows.
   if [[ "$mode" == detached ]] && (( killed_by_signal == 0 )); then
@@ -776,16 +885,25 @@ print_run_status() {
 }
 
 run_wait_is_settled() {
-  local pinned=$1 reported="${run_state[status]:-}"
-  local pid="${run_state[pid]:-0}" starter_pid="${run_state[starterPid]:-0}"
-  [[ "${run_state[runId]:-}" == "$pinned" ]] || return 0
-  if [[ "$reported" == running || "$reported" == starting ]]; then
-    run_record_is_alive "$reported" "$pid" "$starter_pid" && return 1
-    return 0
-  fi
-  # A terminal detached run remains unsettled while callback delivery is in flight.
-  [[ "${run_state[callback]:-}" == pending ]] && run_is_alive "$pid" && return 1
-  return 0
+  local pinned=$1 attempt reported pid starter_pid
+  for attempt in 0 1; do
+    [[ "${run_state[runId]:-}" == "$pinned" ]] || return 0
+    reported="${run_state[status]:-}"
+    pid="${run_state[pid]:-0}"
+    starter_pid="${run_state[starterPid]:-0}"
+    if [[ "$reported" == running || "$reported" == starting ]]; then
+      run_record_is_alive "$reported" "$pid" "$starter_pid" && return 1
+    elif [[ "${run_state[callback]:-}" != pending ]]; then
+      return 0
+    elif run_is_alive "$pid"; then
+      return 1
+    fi
+
+    # The runner may have committed its final state between our snapshot and
+    # liveness check. Refresh once after observing its exit.
+    (( attempt == 0 )) || return 0
+    load_run_state
+  done
 }
 
 do_status() {
@@ -821,12 +939,14 @@ await_run_exit() {
 }
 
 do_kill() {
-  local pid run_mode recorded_work_path cleanup_status=0
+  local pid run_mode recorded_launch_path recorded_work_path cleanup_status=0
   load_run_state
   pid="${run_state[pid]:-0}"
   run_mode="${run_state[mode]:-}"
   if ! run_target_is_alive "$pid" "$run_mode"; then
+    recorded_launch_path="${run_state[launchPath]:-}"
     recorded_work_path="${run_state[workPath]:-}"
+    cleanup_recorded_invocation_path "$recorded_launch_path" || cleanup_status=$?
     cleanup_recorded_reporter_work_path "$recorded_work_path" || cleanup_status=$?
     load_run_state
     print_run_status
@@ -839,7 +959,9 @@ do_kill() {
     await_run_exit "$pid" "$run_mode" 8
   fi
   load_run_state
+  recorded_launch_path="${run_state[launchPath]:-}"
   recorded_work_path="${run_state[workPath]:-}"
+  cleanup_recorded_invocation_path "$recorded_launch_path" || cleanup_status=$?
   cleanup_recorded_reporter_work_path "$recorded_work_path" || cleanup_status=$?
   if [[ "${run_state[status]:-}" == running || "${run_state[status]:-}" == starting ]]; then
     update_run_state 'status=killed' "finishedAt=$EPOCHSECONDS" || true
@@ -889,6 +1011,7 @@ adopt_run() {
     printf '%s: detached run state is missing: %s\n' "$ROLE" "$RUN_FILE" >&2
     exit 1
   fi
+  create_invocation_path
   update_run_state \
     "pid=$$" \
     'starterPid=' \
@@ -896,7 +1019,8 @@ adopt_run() {
     'mode=detached' \
     'callback=pending' \
     "review=$review_mode" \
-    "reviewers=$reviewer_count"
+    "reviewers=$reviewer_count" \
+    "launchPath=$invocation_path"
   run_owned=1
 }
 
@@ -905,7 +1029,11 @@ case "$mode" in
   kill) do_kill; exit 0 ;;
   start) do_start; exit 0 ;;
   detached) adopt_run ;;
-  blocking) claim_run blocking "$$" running skipped; run_owned=1 ;;
+  blocking)
+    create_invocation_path
+    claim_run blocking "$$" running skipped
+    run_owned=1
+    ;;
 esac
 
 rm -f -- "$RESPONSE_FILE"
@@ -1006,28 +1134,29 @@ invocation_prompt=''
 if [[ "$ROLE" == reporter ]]; then
   printf -v invocation_prompt '## Current request from the orchestrator
 
-Private working directory (removed when this run ends): %s
+Launch-only working directory (removed when this run ends): %s
+Private artifact directory (removed when this run ends): %s
 Garcon CLI command: %s
 Transcript query path: %s
 
-Treat this request as self-contained. The parent/orchestrator owns the user task, decisions, implementation, final verification, and user communication. Use only sources and source locators supplied in the goal. Put transient files only in the private working directory and leave them there for launcher cleanup. Do not modify any source transcript, repository, Git state, or Garcon chat. Do not delegate or ask questions. Return one complete result.
+Treat this request as self-contained. The parent/orchestrator owns the user task, decisions, implementation, final verification, and user communication. Use only sources and source locators supplied in the goal. Put transient files only in the private artifact directory and leave them there for launcher cleanup. Do not modify any source transcript, repository, Git state, or Garcon chat. Do not delegate or ask questions. Return one complete result.
 
 Goal:
 %s' \
-    "$WORK_PATH" "$GARCON_CLI_COMMAND" "$TRANSCRIPT_QUERY_PATH" "$user_prompt"
+    "$INVOCATION_PATH" "$WORK_PATH" "$GARCON_CLI_COMMAND" "$TRANSCRIPT_QUERY_PATH" "$user_prompt"
 else
   printf -v invocation_prompt '## Current request from the orchestrator
 
-Initial working directory: %s
+Launch-only working directory (removed when this run ends): %s
 Shared sandbox directory: %s
 
 Treat this request as self-contained. The parent/orchestrator owns the user task, all intended changes to the target repository, integration, final verification, and user communication.
 
 You may read any path available to the current OS user. The parent and every Garcon-Amp specialist for this chat share the sandbox. Reuse any checkout, source, or artifact named in the request or already present there; never duplicate one that is safe and usable for the requested operation. Only when the role prompt permits investigative writes, put them in the shared sandbox and give new artifacts distinct names. Acquire any source only when the role prompt permits it, the current request requires it, and no available source is safe and usable for that permitted operation; keep it at an absolute path in the shared sandbox and report its origin and path. Do not intentionally modify the target repository or its Git state, and do not delegate to another agent.
 
-Return a complete result; no one can answer questions during this invocation.
+Do not put artifacts or target checkouts in the launch-only directory. Return a complete result; no one can answer questions during this invocation.
 
-%s' "$GARCON_PATH" "$SANDBOX_PATH" "$user_prompt"
+%s' "$INVOCATION_PATH" "$SANDBOX_PATH" "$user_prompt"
 fi
 
 if [[ ! -f "$ROLE_PROMPT_PATH" || ! -r "$ROLE_PROMPT_PATH" ]]; then
@@ -1052,24 +1181,47 @@ if [[ "$ROLE" == reporter ]] && {
   exit 1
 fi
 role_prompt="$(<"$ROLE_PROMPT_PATH")"
-invocation_prompt="${role_prompt}"$'\n\n---\n\n'"${invocation_prompt}"
+policy_prompt_path=$ROLE_PROMPT_PATH
 if (( review_mode )); then
   if [[ ! -f "$REVIEW_PROMPT_PATH" || ! -r "$REVIEW_PROMPT_PATH" ]]; then
     printf '%s: review prompt is unavailable: %s\n' "$ROLE" "$REVIEW_PROMPT_PATH" >&2
     exit 1
   fi
+  policy_prompt_path="$(mktemp "$STATE_PATH/.$ROLE.policy.XXXXXX")"
+  temporary_files+=("$policy_prompt_path")
+  chmod 600 "$policy_prompt_path"
+  {
+    printf '%s\n\n---\n\n' "$role_prompt"
+    cat "$REVIEW_PROMPT_PATH"
+  } >"$policy_prompt_path"
 fi
 
 print_invocation_prompt() {
   printf '%s\n' "$invocation_prompt"
-  if (( review_mode )); then
-    printf '\n---\n\n'
-    cat "$REVIEW_PROMPT_PATH"
-  fi
+}
+
+render_codex_model_instructions_file() {
+  bun -e '
+process.stdout.write(`model_instructions_file=${JSON.stringify(Bun.argv[1])}`);
+' "$policy_prompt_path"
+}
+
+render_opencode_config() {
+  bun -e '
+const [baseConfig, agentName, promptPath] = Bun.argv.slice(1);
+const config = JSON.parse(baseConfig);
+const agent = config.agent?.[agentName];
+if (agent === undefined) {
+  console.error(`OpenCode agent configuration is missing: ${agentName}`);
+  process.exit(1);
+}
+agent.prompt = await Bun.file(promptPath).text();
+process.stdout.write(JSON.stringify(config));
+' "$OPENCODE_CONFIG_JSON" "$OPENCODE_AGENT_NAME" "$policy_prompt_path"
 }
 
 run_codex() {
-  local events_file response_file sandbox_mode=danger-full-access status
+  local events_file model_instructions_file response_file sandbox_mode=danger-full-access status
   local -a command=(codex)
 
   if [[ "$ROLE" == finder ]]; then sandbox_mode=read-only; fi
@@ -1082,10 +1234,12 @@ run_codex() {
   if [[ "$EFFORT_OR_VARIANT" != default ]]; then
     command+=(-c "model_reasoning_effort=\"$EFFORT_OR_VARIANT\"")
   fi
+  model_instructions_file="$(render_codex_model_instructions_file)" || return
+  command+=(-c "$model_instructions_file")
   command+=(
     --ask-for-approval never
     --sandbox "$sandbox_mode"
-    --cd "$WORK_PATH"
+    --cd "$INVOCATION_PATH"
     exec
     --skip-git-repo-check
     --ephemeral
@@ -1098,7 +1252,7 @@ run_codex() {
 
   set +e
   (
-    cd "$WORK_PATH"
+    cd "$INVOCATION_PATH"
     print_invocation_prompt | "${command[@]}" -
   ) >"$events_file"
   status=$?
@@ -1141,9 +1295,11 @@ run_claude() {
   command=(
     claude
     -p
+    --safe-mode
     --model "$MODEL"
     --permission-mode dontAsk
     --no-session-persistence
+    --append-system-prompt-file "$policy_prompt_path"
     --add-dir /
     --tools "$tool_names"
     --allowed-tools "$tool_names"
@@ -1160,7 +1316,7 @@ run_claude() {
 
   set +e
   (
-    cd "$WORK_PATH"
+    cd "$INVOCATION_PATH"
     print_invocation_prompt | "${clean_env[@]}" "${command[@]}"
   )
   status=$?
@@ -1182,6 +1338,8 @@ run_pi() {
     --tools "$tool_names"
     --no-skills
     --no-prompt-templates
+    --no-context-files
+    --append-system-prompt "$policy_prompt_path"
     --no-approve
   )
   if [[ "$EFFORT_OR_VARIANT" != default ]]; then
@@ -1190,7 +1348,7 @@ run_pi() {
 
   set +e
   (
-    cd "$WORK_PATH"
+    cd "$INVOCATION_PATH"
     print_invocation_prompt | "${command[@]}"
   )
   status=$?
@@ -1201,11 +1359,11 @@ run_pi() {
 
 run_opencode() {
   local events_file export_error_file export_file response_file session_file session_id
-  local status parse_status export_status
+  local status parse_status export_status opencode_config_json
   local -a command=(
     opencode run
     --pure
-    --dir "$WORK_PATH"
+    --dir "$INVOCATION_PATH"
     --model "$PROVIDER/$MODEL"
     --agent "$OPENCODE_AGENT_NAME"
     --format json
@@ -1230,10 +1388,11 @@ run_opencode() {
   if [[ "$EFFORT_OR_VARIANT" != default ]]; then
     command+=(--variant "$EFFORT_OR_VARIANT")
   fi
+  opencode_config_json="$(render_opencode_config)" || return
   set +e
   (
-    cd "$WORK_PATH"
-    print_invocation_prompt | env OPENCODE_CONFIG_CONTENT="$OPENCODE_CONFIG_JSON" "${command[@]}"
+    cd "$INVOCATION_PATH"
+    print_invocation_prompt | env OPENCODE_CONFIG_CONTENT="$opencode_config_json" "${command[@]}"
   ) >"$events_file"
   status=$?
   set -e
@@ -1283,8 +1442,8 @@ await Bun.write(sessionPath, sessionID);
   set +e
   # OpenCode can truncate large exports on a pipe; direct regular-file output is required.
   (
-    cd "$WORK_PATH"
-    env OPENCODE_CONFIG_CONTENT="$OPENCODE_CONFIG_JSON" \
+    cd "$INVOCATION_PATH"
+    env OPENCODE_CONFIG_CONTENT="$opencode_config_json" \
       opencode export --pure "$session_id" </dev/null
   ) >"$export_file" 2>"$export_error_file"
   export_status=$?
@@ -1494,6 +1653,9 @@ else
   run_selected_agent >"$RESPONSE_FILE" || agent_status=$?
 fi
 
+if ! cleanup_invocation_path; then
+  agent_status=1
+fi
 if [[ "$ROLE" == reporter ]]; then
   if ! cleanup_reporter_work_path; then
     agent_status=1

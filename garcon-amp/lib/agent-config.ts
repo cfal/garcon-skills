@@ -1,5 +1,8 @@
 export const ROLE_NAMES = ['oracle', 'finder', 'librarian', 'reporter'] as const;
 
+const AGENT_NAMES = ['codex', 'claude', 'pi', 'opencode'] as const;
+const RESERVED_SPEC_ALIAS_NAMES = new Set<string>(AGENT_NAMES);
+
 export type RoleName = (typeof ROLE_NAMES)[number];
 
 const CODEX_EFFORTS = ['default', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
@@ -15,6 +18,8 @@ export type AgentConfig =
   | { agent: 'claude'; model: string; effort: ClaudeEffort }
   | { agent: 'pi'; provider: string; model: string; effort: PiEffort }
   | { agent: 'opencode'; provider: string; model: string; variant: string };
+
+export type SpecAliasMap = ReadonlyMap<string, string>;
 
 function assertValue(kind: string, value: string) {
   if (!value || /[:,\u0000\r\n]/.test(value)) throw new Error(`invalid ${kind}`);
@@ -69,6 +74,61 @@ export function parseAgentSpec(spec: string): AgentConfig {
   }
 }
 
+export function parseSpecAliasName(name: string) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+    throw new Error(`invalid spec alias name: ${name || '<empty>'}`);
+  }
+  if (RESERVED_SPEC_ALIAS_NAMES.has(name)) {
+    throw new Error(`reserved spec alias name: ${name}`);
+  }
+  return name;
+}
+
+export function parseSpecAliasTarget(target: string) {
+  try {
+    return canonicalAgentSpec(parseAgentSpec(target));
+  } catch {
+    const fields = target.split(':');
+    const agent = fields[0];
+
+    switch (agent) {
+      case 'codex':
+      case 'claude':
+        if (fields.length !== 2) break;
+        assertValue('model', fields[1]!);
+        return target;
+      case 'pi':
+      case 'opencode':
+        if (fields.length !== 3) break;
+        assertProvider(fields[1]!);
+        assertValue('model', fields[2]!);
+        return target;
+    }
+  }
+  throw new Error('spec alias target must be a complete agent spec or omit only its final level');
+}
+
+export function resolveAgentSpecAlias(spec: string, aliases: SpecAliasMap) {
+  const separator = spec.indexOf(':');
+  const name = separator === -1 ? spec : spec.slice(0, separator);
+  const target = aliases.get(name);
+  return target === undefined ? spec : `${target}${spec.slice(name.length)}`;
+}
+
+export function parseAgentSpecWithAliases(spec: string, aliases: SpecAliasMap) {
+  const resolved = resolveAgentSpecAlias(spec, aliases);
+  try {
+    return parseAgentSpec(resolved);
+  } catch (error) {
+    if (resolved !== spec) {
+      const separator = spec.indexOf(':');
+      const name = separator === -1 ? spec : spec.slice(0, separator);
+      throw new Error(`alias "${name}" resolved to "${resolved}": ${error.message}`);
+    }
+    throw error;
+  }
+}
+
 export function canonicalAgentSpec(config: AgentConfig) {
   switch (config.agent) {
     case 'codex':
@@ -81,16 +141,19 @@ export function canonicalAgentSpec(config: AgentConfig) {
   }
 }
 
-export function parseAgentSpecList(value: string) {
+export function parseAgentSpecList(value: string, aliases?: SpecAliasMap) {
   const specs = value.split(',');
   if (specs.some((spec) => spec === '')) {
     throw new Error('agent spec list contains an empty entry');
   }
 
-  const configs = specs.map(parseAgentSpec);
+  const configs = aliases === undefined
+    ? specs.map(parseAgentSpec)
+    : specs.map((spec) => parseAgentSpecWithAliases(spec, aliases));
   const canonicalSpecs = configs.map(canonicalAgentSpec);
   if (new Set(canonicalSpecs).size !== canonicalSpecs.length) {
-    throw new Error('agent spec list contains a duplicate');
+    const changed = specs.some((spec, index) => spec !== canonicalSpecs[index]);
+    throw new Error(`agent spec list contains a duplicate${changed ? ' after alias resolution' : ''}`);
   }
   return configs;
 }

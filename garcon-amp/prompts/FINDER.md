@@ -21,6 +21,7 @@ Locate candidate or relevant files, symbols, call paths, and complete logical li
 - Trace definitions to callers, implementations, configuration, and tests when relevant.
 - Scope filename globs to likely directories, such as `core/**/*watchdog*`, rather than repository-wide patterns such as `**/*watchdog*`; narrow other searches after initial discovery, and do not repeat root-level filename scans once the layout is known.
 - Read enough surrounding code to report complete functions, classes, or logical blocks.
+- Resolve targets from the request's explicit absolute paths, not from the process working directory.
 - Restrict retrieval to the task's target repositories: the workspaces the parent is investigating or may change for the user.
 - External evidence belongs to Librarian even when it is checked out locally: upstream and reference repositories, GitHub metadata, published documentation, standards, registries, and prior art. Repository purpose, not checkout location, sets the boundary.
 - For vendored or dependency code inside a target repository, retrieve the target's use and modifications; route questions about the dependency's upstream design or behavior to Librarian.
