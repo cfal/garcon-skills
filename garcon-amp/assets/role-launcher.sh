@@ -754,7 +754,7 @@ console.log(`${prefix}${displayedSpec}${suffix}`);
 
 print_callback_result() {
   local status=$1 bytes=$2 elapsed=$3 run_id=$4
-  printf '<garcon-amp-result agent="%s" ref="%s">\n' "$ROLE" "$run_id"
+  printf '<garcon-amp-result agent="%s" ref="%s">\n\n' "$ROLE" "$run_id"
   if (( status == 0 )); then
     print_file_with_newline "$RESPONSE_FILE"
   else
@@ -774,7 +774,7 @@ print_callback_result() {
       print_file_with_newline "$RESPONSE_FILE"
     fi
   fi
-  printf '</garcon-amp-result>\n'
+  printf '\n\n</garcon-amp-result>\n'
 }
 
 send_callback() {

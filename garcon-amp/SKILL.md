@@ -18,11 +18,11 @@ Treat these rules as non-negotiable:
 
 ## Activate or rehydrate
 
-Setup requires a 16-digit Garcon chat ID disclosed for the current activation. Each fork or new parent-agent run begins an activation. Steering, its direct-control continuation, and mid-run compaction stay inside it.
+Setup requires a Garcon chat ID disclosed for the current activation. Each fork or new parent-agent run begins an activation. Steering, its direct-control continuation, and mid-run compaction stay inside it.
 
-1. Before the activation's first setup, unless handling its disclosure, place exactly `<garcon-get-chat-id />` at an assistant message's physical beginning or end. It must touch that edge; after prose, put it on a new line. Other content may appear only on the other side, and the turn may continue. Never place it in reasoning. Emit it only if this activation has not requested it.
-2. Garcon first steers the emitting run; if unavailable, it starts one direct control run. Do not delay or poll; continue only setup-independent work. If neither resumes, do not run setup; the visible `Chat ID auto-discovery` notice reports why.
-3. Accept only post-marker input equal to `<garcon-chat-id>[0-9]{16}</garcon-chat-id>` after trimming whitespace and the provider's optional steering preamble. Use only this activation's disclosure for every setup. Later calls and compaction may recover its ID only from this activation's own in-context setup packet, never from a file or sandbox path. After a fork or new activation, ignore inherited disclosures, chat IDs, and packets and request again. Never derive an ID from host state, tools, files, searches, sandbox paths, or specialist output. Without one, do not run setup.
+1. Before an activation, place exactly `<garcon-get-chat-id />` at a message's beginning or end. It must touch that edge; after prose, put it on a new line. Other content may appear only on the other side, and the turn may continue.
+2. Garcon first steers the emitting run; if unavailable, it starts one direct control run. Do not delay or poll; continue only setup-independent work. If neither resumes, do not run setup.
+3. Accept only input equal to `<garcon-chat-id>[0-9]+</garcon-chat-id>` at a message's beginning or end. Use this activation's disclosure for only this setup. After a fork or new activation, ignore inherited disclosures, chat IDs, and packets and request again. Never derive an ID from host state, tools, files, searches, sandbox paths, or specialist output. Without one, do not run setup.
 
 `--garcon-path` is optional and explicitly selects a Garcon repository, overriding discovery. Without a prior selection, setup uses `garcon-cli` on `PATH`, then a valid repository at `$HOME/garcon`, then `/garcon`. Reruns preserve the recorded CLI source. If none resolves, stop and ask the user for the Garcon path. On first setup, run from this skill directory:
 
@@ -44,31 +44,17 @@ codex:<model>:<effort>
 claude:<model>:<effort>
 pi:<provider>:<model>:<effort>
 opencode:<provider>:<model>:<variant>
+<alias>
+<alias>:<effort>
 ```
 
-Bundled role defaults come from the packaged `defaults.conf`. User defaults are read only from `$HOME/.config/garcon-amp.conf`; when absent, setup creates it from the packaged defaults and discloses that creation. Unprefixed `<role>=<spec-or-alias>` lines define the reserved `default` profile. Named profiles use exactly this five-line form, with no blank or unrelated lines inside the block:
+ALWAYS FOLLOW the complete runtime packet returned by `garcon-amp-setup`. between `GARCON-AMP INSTRUCTIONS BEGIN` and `GARCON-AMP INSTRUCTIONS END`.
 
-```text
-[profile:<name>]
-oracle=<spec-or-alias>
-finder=<spec-or-alias>
-librarian=<spec-or-alias>
-reporter=<spec-or-alias>
-```
+The runtime packet returned by setup also defines row rendering and disclosure behavior. Run `./garcon-amp-setup --help` for validation and reset details.
 
-Parsing resumes normally after `reporter`. Profile names are case-sensitive, and a complete user profile replaces a packaged profile of the same name as a whole. Oracle accepts a comma-separated list. `spec-alias:<name>=<agent-spec-prefix>` defines a case-sensitive, single-pass shorthand whose target may omit only the final level. Role lines, profile blocks, setup flags, and Oracle `--spec` accept aliases; resolved specs drive validation, execution, and titles. Repeated `--oracle` flags build its list. Fresh setup and `--reset-defaults` use `default`; apply `--profile <name>` only when the user selects it, never by inferring task difficulty. It replaces the whole role bundle, then explicit role flags override it. Established chats preserve resolved snapshots until a profile is explicitly reapplied, changed by role flags, or reset. Launchers read the private chat-scoped config; profile definitions and specs are not embedded in them.
+Never reconstruct launcher paths from memory.
 
-Every installation requires `bun`, `setsid`, and each agent CLI selected by the effective role configuration on `PATH`; unselected profiles add no executable prerequisite. Preserve user-supplied provider and model IDs exactly; never infer a Pi or OpenCode provider. Pi launchers load user-configured extensions because providers may be extension-registered; project-local Pi resources remain untrusted, and skills and prompt templates remain disabled.
-
-`--shared-sandbox` requires an absolute path, creates a missing directory recursively, and applies owner-only permissions. Do not select `$HOME` or a group-shared directory whose existing permissions must remain intact. Its first-run default is under `/tmp`, which is RAM-backed on many hosts; choose a disk-backed directory when clones, indexes, builds, or Reporter exports may be large.
-
-Every consultation publishes its complete caller-supplied request in a collapsed Garcon transcript row. Treat that transcript copy as user-visible and do not include secrets unless the user authorized Garcon transcript visibility. The runtime packet defines row rendering and disclosure behavior. Run `./garcon-amp-setup --help` for validation and reset details.
-
-Reporter accepts every agent-spec grammar above and uses that adapter's ordinary tool access. Its bundled spec is the `reporter` assignment in `defaults.conf`; configure any credentials required by that selected adapter and provider. Invoke Reporter with one self-contained goal. The runtime packet defines allowed source locators, retrieval, and private-artifact-directory behavior. Pass primary locators instead of substituting parent-preprocessed transcript content.
-
-Oracle runs its configured reviewers by default. User-directed repeated `--spec` flags append the exact supplied spec or alias tokens; `--no-defaults` omits configured reviewers. Never infer or persist runtime selections. The runtime packet defines resolution, concurrency, attribution, and result handling.
-
-Read and follow the complete runtime packet between `GARCON-AMP INSTRUCTIONS BEGIN` and `GARCON-AMP INSTRUCTIONS END`. It supplements this contract with current resolved paths and operational details. If the end marker is missing from tool output, read the generated instruction file whose path appears near the beginning of the packet and verify its end marker. Never reconstruct launcher paths from memory.
+Oracle runs its configured reviewers by default. User-directed repeated `--spec` flags append the exact supplied spec or alias tokens; `--no-defaults` omits configured reviewers. Never infer or persist runtime selections. The runtime packet also defines resolution, concurrency, attribution, and result handling.
 
 Rerun setup before an activation's first specialist use, after mid-run compaction, or whenever Garcon-Amp state is uncertain. An established installation can be rehydrated with:
 
