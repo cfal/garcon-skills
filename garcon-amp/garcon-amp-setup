@@ -40,11 +40,23 @@ const bundledRoleDefaultsSource = await requireBundledFile(
 const bundledDefaults = parseConfigAssignments(
   bundledRoleDefaultsSource,
   bundledRoleDefaultsPath,
-  { allowProfiles: true, requireAll: true, kind: 'bundled role default' },
+  {
+    allowAliases: true,
+    allowDefaultProfile: true,
+    allowProfiles: true,
+    resolveAliases: true,
+    kind: 'bundled role default',
+  },
 );
-const bundledRoleDefaults = bundledDefaults.specs;
+const bundledDefaultProfileName = bundledDefaults.defaultProfile ?? defaultProfileName;
+const bundledRoleDefaults = requireProfile(
+  bundledDefaultProfileName,
+  bundledDefaults,
+  bundledRoleDefaultsPath,
+  'bundled role default',
+);
 const bundledProfiles = bundledDefaults.profiles;
-const bundledRoleDefaultsContent = renderRoleAssignments(bundledRoleDefaults);
+const bundledRoleDefaultsContent = ensureTrailingNewline(bundledRoleDefaultsSource);
 
 const roleDefinitions = {
   oracle: { prompt: 'ORACLE.md', title: 'Oracle', accent: '0891b2,22d3ee' },
@@ -68,9 +80,8 @@ Options:
                            (created recursively when missing)
                            (existing selection is tightened to 0700)
                            (first-run default: /tmp/garcon-amp-<chat-id>/sandbox)
-  --profile <name>        Select a complete named role profile for this chat
-                           (default selects the unprefixed role assignments)
-  --reset-defaults        Reset roles to the default profile and reset sandbox
+  --profile <name>        Select that exact complete role profile for this chat
+  --reset-defaults        Reset roles to the configured default profile and sandbox
                            before explicit overrides
 
 Role options:
@@ -96,9 +107,8 @@ Bundled defaults (defaults.conf):
 User profile/default file:
   $HOME/.config/garcon-amp.conf
 
-Setup creates this file with the bundled defaults when it is missing. Role lines
-use <specialist-role>=<spec-or-alias> for the default profile. Named profiles use
-exactly this five-line form, with no blank or unrelated lines inside the block:
+Setup creates this file with the bundled configuration when it is missing. Profiles
+use exactly this five-line form, with no blank or unrelated lines inside the block:
 
   [profile:<name>]
   oracle=<spec-or-alias>
@@ -106,14 +116,17 @@ exactly this five-line form, with no blank or unrelated lines inside the block:
   librarian=<spec-or-alias>
   reporter=<spec-or-alias>
 
-Parsing resumes normally after reporter. default is reserved for the unprefixed
-assignments. Names match [A-Za-z0-9][A-Za-z0-9._-]* and are case-sensitive; a
-complete user profile replaces a packaged namesake as a whole. Oracle may use a
-comma-separated list. Alias lines use
+Parsing resumes normally after reporter. default-profile=<name> selects the profile
+used by fresh setup and --reset-defaults. For backward compatibility, unprefixed
+role assignments are equivalent to [profile:default]. They are immediately upgraded
+by inserting default-profile=default and [profile:default]; pre-existing selector or
+default-block mixtures fail. Names match [A-Za-z0-9][A-Za-z0-9._-]* and are
+case-sensitive; a complete user profile replaces a packaged namesake as a whole.
+Oracle may use a comma-separated list. Alias lines use
 spec-alias:<name>=<agent-spec-prefix>; a target may omit only its final level.
 Aliases expand one exact first segment, once. --profile replaces the whole role
 bundle, then explicit role options override it. Established resolved roles remain
-preserved until explicitly changed, reselected, or reset to the default profile.
+preserved until explicitly changed, reselected, or reset to the configured default.
 
 Every successful rerun validates the installation, publishes a re-initialized
 notice in the selected chat, and reprints its complete runtime instruction packet.
@@ -129,6 +142,7 @@ const installationFileName = '.installation.json';
 const initializationNoticeTitle = 'Garcon-Amp initialized';
 const reinitializationNoticeTitle = 'Garcon-Amp re-initialized';
 const roleDefaultsCreationNotice = 'Created $HOME/.config/garcon-amp.conf with defaults';
+const roleDefaultsUpgradeNotice = 'Upgraded $HOME/.config/garcon-amp.conf to [profile:default]';
 const noRoleChangesNotice = 'No changes';
 const specAliasesChangedNotice = 'Spec aliases changed';
 
@@ -150,6 +164,74 @@ function parseProfileName(name) {
 
 function normalizeConfigLine(line) {
   return line.endsWith('\r') ? line.slice(0, -1) : line;
+}
+
+function ensureTrailingNewline(content) {
+  return content.endsWith('\n') ? content : `${content}\n`;
+}
+
+function renderLegacyUserConfigUpgrade(content, filePath) {
+  const rawLines = content.split('\n');
+  const lines = rawLines.map(normalizeConfigLine);
+  let roleLineIndex = -1;
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (/^\[profile:\S+\]$/.test(line)) {
+      index += ROLE_NAMES.length;
+      continue;
+    }
+    const separator = line.indexOf('=');
+    if (separator > 0 && ROLE_NAMES.includes(line.slice(0, separator))) {
+      roleLineIndex = index;
+      break;
+    }
+  }
+  if (roleLineIndex === -1) return undefined;
+  if (lines.some((line) => line.startsWith('default-profile='))) {
+    fail(
+      `legacy unprefixed roles cannot be combined with default-profile in role default: ${filePath}`,
+    );
+  }
+  if (lines.includes(`[profile:${defaultProfileName}]`)) {
+    fail(
+      `legacy unprefixed roles cannot be combined with [profile:default] in role default: ${filePath}`,
+    );
+  }
+  const carriageReturn = rawLines[roleLineIndex].endsWith('\r') ? '\r' : '';
+  rawLines.splice(
+    roleLineIndex,
+    0,
+    `default-profile=default${carriageReturn}`,
+    carriageReturn,
+    `[profile:${defaultProfileName}]${carriageReturn}`,
+  );
+  return rawLines.join('\n');
+}
+
+async function upgradeLegacyUserConfig(content, filePath, identity) {
+  const upgradedContent = renderLegacyUserConfigUpgrade(content, filePath);
+  if (upgradedContent === undefined) return { content, wasUpgraded: false };
+  const current = await requireOwnedRegularFileIfPresent(filePath, 'role defaults file');
+  let currentContent;
+  try {
+    currentContent = current ? await readFile(filePath, 'utf8') : undefined;
+  } catch (error) {
+    fail(`cannot reread role defaults file before upgrade: ${filePath}: ${error.message}`);
+  }
+  if (
+    !current
+    || current.dev !== identity.dev
+    || current.ino !== identity.ino
+    || currentContent !== content
+  ) {
+    fail(`role defaults file changed during setup; rerun to use it: ${filePath}`);
+  }
+  try {
+    await atomicWrite(filePath, upgradedContent, current.mode & 0o777);
+  } catch (error) {
+    fail(`cannot upgrade role defaults file: ${filePath}: ${error.message}`);
+  }
+  return { content: upgradedContent, wasUpgraded: true };
 }
 
 function parseRawProfileBlock(lines, headerIndex, profileName, filePath, kind) {
@@ -212,12 +294,21 @@ function parseRawRoleAssignments(
   return specs;
 }
 
+function requireProfile(profileName, config, filePath, kind) {
+  const specs = config.profiles.get(profileName);
+  if (specs === undefined) {
+    fail(`${kind} selects unknown default profile "${profileName}": ${filePath}`);
+  }
+  return specs;
+}
+
 function parseConfigAssignments(
   content,
   filePath,
   {
     allowAliases = false,
     allowBaseProfile = false,
+    allowDefaultProfile = false,
     allowProfiles = false,
     requireAll = false,
     resolveAliases = false,
@@ -229,6 +320,7 @@ function parseConfigAssignments(
   const rawProfiles = new Map();
   const seen = new Set();
   let baseProfile;
+  let defaultProfile;
   const lines = content.split('\n').map(normalizeConfigLine);
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
@@ -247,12 +339,6 @@ function parseConfigAssignments(
         profileName = parseProfileName(match[1]);
       } catch (error) {
         fail(`invalid profile header at ${filePath}:${index + 1}: ${error.message}`);
-      }
-      if (profileName === defaultProfileName) {
-        fail(
-          `invalid profile header at ${filePath}:${index + 1}: `
-          + 'the default profile must use unprefixed role assignments',
-        );
       }
       if (rawProfiles.has(profileName)) {
         fail(`duplicate profile "${profileName}" at ${filePath}:${index + 1}`);
@@ -305,6 +391,21 @@ function parseConfigAssignments(
       continue;
     }
 
+    if (assignment === 'default-profile') {
+      if (!allowDefaultProfile) {
+        fail(`unknown specialist role in ${kind} at ${filePath}:${index + 1}: ${assignment}`);
+      }
+      if (defaultProfile !== undefined) {
+        fail(`duplicate default profile in ${kind} at ${filePath}:${index + 1}`);
+      }
+      try {
+        defaultProfile = parseProfileName(line.slice(separator + 1));
+      } catch (error) {
+        fail(`invalid default profile in ${kind} at ${filePath}:${index + 1}: ${error.message}`);
+      }
+      continue;
+    }
+
     if (assignment.startsWith('profile:')) {
       fail(
         `invalid profile syntax at ${filePath}:${index + 1}; `
@@ -316,6 +417,11 @@ function parseConfigAssignments(
     const spec = line.slice(separator + 1);
     if (!ROLE_NAMES.includes(name)) {
       fail(`unknown specialist role in ${kind} at ${filePath}:${index + 1}: ${name}`);
+    }
+    if (allowProfiles) {
+      fail(
+        `unprefixed role assignments are not allowed in ${kind} at ${filePath}:${index + 1}`,
+      );
     }
     if (seen.has(name)) fail(`duplicate ${name} ${kind} at ${filePath}:${index + 1}`);
     seen.add(name);
@@ -335,7 +441,7 @@ function parseConfigAssignments(
       requireAll: true,
     }));
   }
-  return { aliases, baseProfile, profiles, specs };
+  return { aliases, baseProfile, defaultProfile, profiles, specs };
 }
 
 async function readUserRoleDefaults() {
@@ -345,11 +451,13 @@ async function readUserRoleDefaults() {
   const info = await requireOwnedRegularFileIfPresent(defaultsPath, 'role defaults file');
   if (!info) {
     return {
-      aliases: new Map(),
+      aliases: bundledDefaults.aliases,
+      defaultProfile: undefined,
       profiles: new Map(),
       specs: {},
       path: defaultsPath,
       shouldCreate: true,
+      wasUpgraded: false,
       home,
     };
   }
@@ -359,27 +467,31 @@ async function readUserRoleDefaults() {
   } catch (error) {
     fail(`cannot read role defaults file: ${defaultsPath}: ${error.message}`);
   }
-  const parsed = parseConfigAssignments(content, defaultsPath, {
+  const upgraded = await upgradeLegacyUserConfig(content, defaultsPath, info);
+  const config = parseConfigAssignments(upgraded.content, defaultsPath, {
     allowAliases: true,
+    allowDefaultProfile: true,
     allowProfiles: true,
     resolveAliases: true,
   });
   return {
-    ...parsed,
+    ...config,
     path: defaultsPath,
     shouldCreate: false,
+    wasUpgraded: upgraded.wasUpgraded,
     home,
   };
 }
 
-function resolveProfileSpecs(profileName, userDefaults) {
-  if (profileName === defaultProfileName) {
-    return Object.fromEntries(ROLE_NAMES.map((name) => [
-      name,
-      userDefaults.specs[name] ?? bundledRoleDefaults[name],
-    ]));
+function configuredDefaultProfile(userDefaults) {
+  if (userDefaults.defaultProfile !== undefined) return userDefaults.defaultProfile;
+  if (userDefaults.profiles.has(defaultProfileName)) {
+    return defaultProfileName;
   }
+  return bundledDefaultProfileName;
+}
 
+function resolveProfileSpecs(profileName, userDefaults) {
   const specs = userDefaults.profiles.get(profileName) ?? bundledProfiles.get(profileName);
   if (specs === undefined) fail(`unknown profile: ${profileName}`);
   return specs;
@@ -772,6 +884,8 @@ const {
 } = parseOptions(Bun.argv.slice(2));
 if (!/^\d{16}$/.test(chatId)) fail('Garcon chat ID must contain exactly 16 digits');
 const userRoleDefaults = await readUserRoleDefaults();
+const selectedDefaultProfileName = configuredDefaultProfile(userRoleDefaults);
+resolveProfileSpecs(selectedDefaultProfileName, userRoleDefaults);
 
 const statePath = path.join('/tmp', `garcon-amp-${chatId}`);
 const existingState = await inspectPrivateDirectory(statePath);
@@ -790,7 +904,7 @@ const shouldApplyProfile = requestedProfile !== undefined
   || resetDefaults
   || existingRoleConfig === undefined;
 const selectedProfileName = shouldApplyProfile
-  ? requestedProfile ?? defaultProfileName
+  ? requestedProfile ?? selectedDefaultProfileName
   : existingRoleConfig.baseProfile ?? defaultProfileName;
 const selectedProfileSpecs = shouldApplyProfile
   ? resolveProfileSpecs(selectedProfileName, userRoleDefaults)
@@ -997,9 +1111,12 @@ if (roleConfigChanged || profileChanged) {
 } else {
   setupNoticeConfig = `${noRoleChangesNotice}\n`;
 }
-const setupNoticeContent = userRoleDefaults.shouldCreate
-  ? `${setupNoticeConfig}\n${roleDefaultsCreationNotice}\n`
-  : setupNoticeConfig;
+let setupNoticeContent = setupNoticeConfig;
+if (userRoleDefaults.shouldCreate) {
+  setupNoticeContent += `\n${roleDefaultsCreationNotice}\n`;
+} else if (userRoleDefaults.wasUpgraded) {
+  setupNoticeContent += `\n${roleDefaultsUpgradeNotice}\n`;
+}
 
 for (const artifact of generatedArtifacts) {
   await atomicWriteIfChanged(

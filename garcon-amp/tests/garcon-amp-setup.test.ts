@@ -22,21 +22,43 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import os from 'node:os';
-import { parseAgentSpec, ROLE_NAMES } from '../lib/agent-config.ts';
+import {
+  canonicalAgentSpecList,
+  parseAgentSpec,
+  parseAgentSpecList,
+  ROLE_NAMES,
+} from '../lib/agent-config.ts';
 
 const skillPath = path.resolve(import.meta.dir, '..');
 const setupPath = path.join(skillPath, 'garcon-amp-setup');
 const bundledRoleDefaultsContent = await readFile(path.join(skillPath, 'defaults.conf'), 'utf8');
-const bundledRoleDefaults = Object.fromEntries(
-  bundledRoleDefaultsContent
-    .split('\n')
-    .map((line) => line.endsWith('\r') ? line.slice(0, -1) : line)
-    .filter((line) => line.trim())
-    .map((assignment) => {
-      const separator = assignment.indexOf('=');
-      return [assignment.slice(0, separator), assignment.slice(separator + 1)];
-    }),
-) as Record<'oracle' | 'finder' | 'librarian' | 'reporter', string>;
+const bundledConfigLines = bundledRoleDefaultsContent.split('\n');
+const bundledAliases = new Map(bundledConfigLines
+  .filter((line) => line.startsWith('spec-alias:'))
+  .map((line) => {
+    const separator = line.indexOf('=');
+    return [line.slice('spec-alias:'.length, separator), line.slice(separator + 1)];
+  }));
+const bundledDefaultProfile = bundledConfigLines
+  .find((line) => line.startsWith('default-profile='))
+  ?.slice('default-profile='.length) ?? 'default';
+const bundledDefaultHeader = bundledConfigLines.indexOf(`[profile:${bundledDefaultProfile}]`);
+if (bundledDefaultHeader === -1) throw new Error('bundled default profile is missing');
+const bundledDefaultOracleAssignment = bundledConfigLines[bundledDefaultHeader + 1];
+const bundledRoleDefaults = Object.fromEntries(ROLE_NAMES.map((role, index) => {
+  const assignment = bundledConfigLines[bundledDefaultHeader + index + 1];
+  const prefix = `${role}=`;
+  if (!assignment?.startsWith(prefix)) throw new Error(`bundled default profile is missing ${role}`);
+  return [
+    role,
+    canonicalAgentSpecList(parseAgentSpecList(assignment.slice(prefix.length), bundledAliases)),
+  ];
+})) as Record<'oracle' | 'finder' | 'librarian' | 'reporter', string>;
+const bundledDefaultSelection = [
+  ...(bundledDefaultProfile === 'default' ? [] : [`base-profile=${bundledDefaultProfile}`]),
+  ...ROLE_NAMES.map((role) => `${role}=${bundledRoleDefaults[role]}`),
+  '',
+].join('\n');
 const agentNames = ['codex', 'claude', 'pi', 'opencode'] as const;
 const commandNames = [
   'bash', 'cat', 'chmod', 'env', 'git', 'grep', 'ln', 'mktemp', 'mv', 'rm', 'setsid', 'sleep', 'tail', 'wc',
@@ -773,6 +795,16 @@ function argumentValue(args: string[], option: string) {
   return index === -1 ? undefined : args[index + 1];
 }
 
+function expectedTranscriptTitle(base: string, specs: readonly string[]) {
+  const prefix = `${base} [`;
+  const availableCodePoints = 120 - [...prefix].length - 1;
+  const codePoints = [...specs.join(', ')];
+  const label = codePoints.length > availableCodePoints
+    ? `${codePoints.slice(0, availableCodePoints - 1).join('')}…`
+    : codePoints.join('');
+  return `${prefix}${label}]`;
+}
+
 function callbackArguments(
   chatId: string,
   role: RoleTitle,
@@ -795,13 +827,13 @@ function callbackArguments(
 }
 
 function resultEnvelopeStart(agent: Lowercase<RoleTitle>, ref: string) {
-  return `<garcon-amp-result agent="${agent}" ref="${ref}">\n`;
+  return `<garcon-amp-result agent="${agent}" ref="${ref}">\n\n`;
 }
 
 function resultEnvelope(agent: Lowercase<RoleTitle>, ref: string, body: string) {
   let normalizedBody = body;
   if (!normalizedBody.endsWith('\n')) normalizedBody += '\n';
-  return `${resultEnvelopeStart(agent, ref)}${normalizedBody}</garcon-amp-result>\n`;
+  return `${resultEnvelopeStart(agent, ref)}${normalizedBody}\n\n</garcon-amp-result>\n`;
 }
 
 beforeAll(async () => {
@@ -852,8 +884,8 @@ describe('garcon-amp setup', () => {
     expect(result.stdout).toContain('--librarian <spec-or-alias>');
     expect(result.stdout).toContain('--reporter <spec-or-alias>');
     expect(result.stdout).toContain('--profile <name>');
-    expect(result.stdout).toContain('default selects the unprefixed role assignments');
-    expect(result.stdout).toContain('Reset roles to the default profile');
+    expect(result.stdout).toContain('Select that exact complete role profile');
+    expect(result.stdout).toContain('Reset roles to the configured default profile');
     expect(result.stdout).toContain('--garcon-path <dir>');
     expect(result.stdout).toContain('an omitted --garcon-path uses garcon-cli on PATH');
     expect(result.stdout).toContain('$HOME/garcon, then /garcon');
@@ -870,7 +902,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     expect(result.stdout).toContain(`reporter=${bundledRoleDefaults.reporter}`);
     expect(result.stdout).toContain('$HOME/.config/garcon-amp.conf');
     expect(result.stdout).not.toContain('$HOME/garcon-amp.conf');
-    expect(result.stdout).toContain('creates this file with the bundled defaults when it is missing');
+    expect(result.stdout).toContain('creates this file with the bundled configuration when it is missing');
     expect(result.stdout).toContain('spec-alias:<name>=<agent-spec-prefix>');
     expect(result.stdout).toContain('exactly this five-line form');
     expect(result.stdout).toContain([
@@ -881,7 +913,10 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       '  reporter=<spec-or-alias>',
     ].join('\n'));
     expect(result.stdout).toContain('Parsing resumes normally after reporter');
-    expect(result.stdout).toContain('default is reserved');
+    expect(result.stdout).toContain('default-profile=<name> selects the profile');
+    expect(result.stdout).toContain(
+      'unprefixed\nrole assignments are equivalent to [profile:default]',
+    );
     expect(result.stdout).toContain('--profile replaces the whole role');
     expect(result.stdout).toContain('bundle, then explicit role options override it');
     expect(result.stdout).toContain('Aliases expand one exact first segment, once');
@@ -954,20 +989,14 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     const packagedSkillPath = path.join(fixturePath, `custom-defaults-skill-${chatCounter}`);
     await cp(skillPath, packagedSkillPath, { recursive: true });
     const customDefaults = [
-      'reporter=opencode:runtime-provider:packaged-reporter:fast',
-      '',
-      'finder=claude:packaged-finder:low',
+      'default-profile=default',
+      '[profile:default]',
       'oracle=codex:packaged-oracle:high',
+      'finder=claude:packaged-finder:low',
       'librarian=pi:runtime-provider:packaged-librarian:minimal',
+      'reporter=opencode:runtime-provider:packaged-reporter:fast',
       '',
     ].join('\r\n');
-    const canonicalCustomDefaults = [
-      'oracle=codex:packaged-oracle:high',
-      'finder=claude:packaged-finder:low',
-      'librarian=pi:runtime-provider:packaged-librarian:minimal',
-      'reporter=opencode:runtime-provider:packaged-reporter:fast',
-      '',
-    ].join('\n');
     await writeFile(path.join(packagedSkillPath, 'defaults.conf'), customDefaults);
     const configuredHome = await mkdtemp(path.join(fixturePath, 'packaged-defaults-home-'));
     const { chatId, statePath } = newChatId();
@@ -987,7 +1016,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       reporter: 'opencode:runtime-provider:packaged-reporter:fast',
     });
     expect(await readFile(path.join(configuredHome, '.config', 'garcon-amp.conf'), 'utf8'))
-      .toBe(canonicalCustomDefaults);
+      .toBe(customDefaults);
 
     const help = await run([
       Bun.which('bun')!,
@@ -1003,7 +1032,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
   test('loads packaged named profiles and lets complete user profiles replace them', async () => {
     const packagedSkillPath = path.join(fixturePath, `packaged-profiles-skill-${chatCounter}`);
     await cp(skillPath, packagedSkillPath, { recursive: true });
-    await writeFile(path.join(packagedSkillPath, 'defaults.conf'), [
+    const packagedDefaultsContent = [
       bundledRoleDefaultsContent.trimEnd(),
       '[profile:economy]',
       'oracle=pi:google:packaged-oracle:low',
@@ -1011,7 +1040,8 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       'librarian=pi:google:packaged-librarian:minimal',
       'reporter=pi:google:packaged-reporter:low',
       '',
-    ].join('\n'));
+    ].join('\n');
+    await writeFile(path.join(packagedSkillPath, 'defaults.conf'), packagedDefaultsContent);
     const configuredHome = await mkdtemp(path.join(fixturePath, 'packaged-profiles-home-'));
     const setupCommand = (chatId: string, profile?: string) => [
       Bun.which('bun')!,
@@ -1028,9 +1058,9 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       env: { HOME: configuredHome },
     });
     expect(defaultResult.exitCode).toBe(0);
-    expect(await activeBaseProfile(defaults.statePath)).toBe('default');
+    expect(await activeBaseProfile(defaults.statePath)).toBe(bundledDefaultProfile);
     expect(await readFile(path.join(configuredHome, '.config', 'garcon-amp.conf'), 'utf8'))
-      .toBe(bundledRoleDefaultsContent);
+      .toBe(packagedDefaultsContent);
 
     const packaged = newChatId();
     const packagedResult = await run(setupCommand(packaged.chatId, 'economy'), {
@@ -1067,11 +1097,120 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     });
   });
 
+  test('selects configured defaults and upgrades legacy assignments immediately', async () => {
+    const profileRoles = [
+      'oracle=codex:literal-default-oracle:high',
+      'finder=codex:literal-default-finder:low',
+      'librarian=codex:literal-default-librarian:minimal',
+      'reporter=codex:literal-default-reporter:high',
+    ];
+    const mediumRoles = [
+      'oracle=codex:medium-oracle:high',
+      'finder=codex:medium-finder:low',
+      'librarian=codex:medium-librarian:minimal',
+      'reporter=codex:medium-reporter:high',
+    ];
+    const profileSpecs = Object.fromEntries(
+      profileRoles.map((assignment) => assignment.split('=')),
+    );
+    const mediumSpecs = Object.fromEntries(
+      mediumRoles.map((assignment) => assignment.split('=')),
+    );
+    const upgradedLegacyLines = [
+      'default-profile=default',
+      '',
+      '[profile:default]',
+      ...profileRoles,
+      '',
+    ];
+    const upgradedLegacyContent = upgradedLegacyLines.join('\n');
+    const configuredHome = await mkdtemp(path.join(fixturePath, 'configured-default-home-'));
+    await mkdir(path.join(configuredHome, '.config'));
+    const defaultsPath = path.join(configuredHome, '.config', 'garcon-amp.conf');
+    await writeFile(defaultsPath, [
+      'default-profile=medium',
+      '[profile:default]',
+      ...profileRoles,
+      '[profile:medium]',
+      ...mediumRoles,
+      '',
+    ].join('\n'));
+    const selected = newChatId();
+
+    expect((await setup(selected.chatId, [], {
+      env: { HOME: configuredHome },
+    })).exitCode).toBe(0);
+    expect(await activeBaseProfile(selected.statePath)).toBe('medium');
+    expect(await activeRoleSpecs(selected.statePath)).toEqual(mediumSpecs);
+
+    expect((await setup(selected.chatId, ['--profile', 'default'], {
+      env: { HOME: configuredHome },
+    })).exitCode).toBe(0);
+    expect(await activeBaseProfile(selected.statePath)).toBe('default');
+    expect(await activeRoleSpecs(selected.statePath)).toEqual(profileSpecs);
+
+    expect((await setup(selected.chatId, ['--reset-defaults'], {
+      env: { HOME: configuredHome },
+    })).exitCode).toBe(0);
+    expect(await activeBaseProfile(selected.statePath)).toBe('medium');
+
+    const legacyHome = await mkdtemp(path.join(fixturePath, 'legacy-default-home-'));
+    await mkdir(path.join(legacyHome, '.config'));
+    const legacyPath = path.join(legacyHome, '.config', 'garcon-amp.conf');
+    await writeFile(legacyPath, `${profileRoles.join('\r\n')}\r\n`);
+    const legacy = newChatId();
+    expect((await setup(legacy.chatId, [], { env: { HOME: legacyHome } })).exitCode).toBe(0);
+    expect(await activeBaseProfile(legacy.statePath)).toBe('default');
+    expect(await activeRoleSpecs(legacy.statePath)).toEqual(profileSpecs);
+    expect(await readFile(legacyPath, 'utf8')).toBe(upgradedLegacyLines.join('\r\n'));
+
+    const failedHome = await mkdtemp(path.join(fixturePath, 'failed-upgrade-home-'));
+    await mkdir(path.join(failedHome, '.config'));
+    const failedPath = path.join(failedHome, '.config', 'garcon-amp.conf');
+    await writeFile(failedPath, `${profileRoles.join('\n')}\n`);
+    const failed = newChatId();
+    expect((await setup(failed.chatId, [], {
+      env: { HOME: failedHome, GARCON_AMP_TEST_ROW_MODE: 'initialization-fail' },
+    })).exitCode).toBe(2);
+    expect(await readFile(failedPath, 'utf8')).toBe(upgradedLegacyContent);
+
+    const malformedHome = await mkdtemp(path.join(fixturePath, 'malformed-upgrade-home-'));
+    await mkdir(path.join(malformedHome, '.config'));
+    const malformedPath = path.join(malformedHome, '.config', 'garcon-amp.conf');
+    const malformedRoles = profileRoles.slice(0, 2);
+    await writeFile(malformedPath, `${malformedRoles.join('\n')}\n`);
+    const malformed = newChatId();
+    const malformedResult = await setup(malformed.chatId, [], { env: { HOME: malformedHome } });
+    expect(malformedResult.exitCode).toBe(2);
+    expect(malformedResult.stderr).toContain('expected librarian=<spec>');
+    expect(await readFile(malformedPath, 'utf8')).toBe([
+      'default-profile=default',
+      '',
+      '[profile:default]',
+      ...malformedRoles,
+      '',
+    ].join('\n'));
+
+    const partialHome = await mkdtemp(path.join(fixturePath, 'partial-upgrade-home-'));
+    await mkdir(path.join(partialHome, '.config'));
+    const partialPath = path.join(partialHome, '.config', 'garcon-amp.conf');
+    const partialContent = `default-profile=default\n${profileRoles.join('\n')}\n`;
+    await writeFile(partialPath, partialContent);
+    const partial = newChatId();
+    const partialResult = await setup(partial.chatId, [], { env: { HOME: partialHome } });
+    expect(partialResult.exitCode).toBe(2);
+    expect(partialResult.stderr).toContain(
+      'legacy unprefixed roles cannot be combined with default-profile',
+    );
+    expect(await readFile(partialPath, 'utf8')).toBe(partialContent);
+  });
+
   test('selects complete named profiles as alias-resolved chat snapshots', async () => {
     const configuredHome = await mkdtemp(path.join(fixturePath, 'profile-home-'));
     await mkdir(path.join(configuredHome, '.config'));
     const defaultsPath = path.join(configuredHome, '.config', 'garcon-amp.conf');
     const profileDefaults = (oracleModel?: string) => [
+      '[profile:default]',
       'oracle=codex:default-oracle:high',
       'finder=claude:default-finder:low',
       'librarian=codex:default-librarian:minimal',
@@ -1157,7 +1296,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     expect((await setupNoticeRows())[0].content).toContain('base-profile=quality.high\n');
   });
 
-  test('layers explicit role options over profiles and always resets to default', async () => {
+  test('layers explicit role options over profiles and resets to the configured default', async () => {
     const configuredHome = await mkdtemp(path.join(fixturePath, 'profile-precedence-home-'));
     await mkdir(path.join(configuredHome, '.config'));
     await writeFile(path.join(configuredHome, '.config', 'garcon-amp.conf'), [
@@ -1166,6 +1305,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       'finder=pi:google:profile-finder:low',
       'librarian=claude:profile-librarian:high',
       'reporter=opencode:runtime-provider:profile-reporter:high',
+      '[profile:default]',
       'oracle=codex:default-oracle:high',
       'finder=codex:default-finder:low',
       'librarian=codex:default-librarian:minimal',
@@ -1303,8 +1443,11 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       '',
     ].join('\n'));
     await writeFile(configuredDefaults, [
+      '[profile:default]',
       'oracle=codex:configured-oracle:high',
       'finder=pi:google:configured-finder:low',
+      `librarian=${bundledRoleDefaults.librarian}`,
+      `reporter=${bundledRoleDefaults.reporter}`,
       '',
     ].join('\n'));
 
@@ -1356,8 +1499,11 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
 
     await writeFile(rowLogPath, '');
     await writeFile(configuredDefaults, [
+      '[profile:default]',
       'oracle=claude:configured-next:max',
       'finder=pi:google:configured-finder:low',
+      `librarian=${bundledRoleDefaults.librarian}`,
+      `reporter=${bundledRoleDefaults.reporter}`,
       '',
     ].join('\n'));
     const preserved = await run([setupPath, chatId], { env: { HOME: configuredHome } });
@@ -1394,6 +1540,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     const configuredHome = await mkdtemp(path.join(fixturePath, 'alias-home-'));
     await mkdir(path.join(configuredHome, '.config'));
     await writeFile(path.join(configuredHome, '.config', 'garcon-amp.conf'), [
+      '[profile:default]',
       'oracle=k3,glm-5.3:high',
       'finder=finder-fast',
       'librarian=ab',
@@ -1487,7 +1634,11 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     await mkdir(path.join(configuredHome, '.config'));
     const defaultsPath = path.join(configuredHome, '.config', 'garcon-amp.conf');
     const writeDefaults = (model: string) => writeFile(defaultsPath, [
+      '[profile:default]',
       'oracle=selected',
+      `finder=${bundledRoleDefaults.finder}`,
+      `librarian=${bundledRoleDefaults.librarian}`,
+      `reporter=${bundledRoleDefaults.reporter}`,
       `spec-alias:selected=codex:${model}:high`,
       '',
     ].join('\n'));
@@ -1532,11 +1683,12 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     expect((await stat(defaultsPath)).mode & 0o777).toBe(0o600);
     expect(await readFile(ignoredLegacyPath, 'utf8')).toBe(ignoredLegacyDefaults);
     expect((await activeRoleSpecs(statePath)).oracle).toBe(defaultRoleSpecs.Oracle);
+    expect((await activeSpecAliases(statePath)).opus).toBe('claude:opus');
     const initialized = await setupNoticeRows();
     expect(initialized).toHaveLength(1);
     expect(initialized[0].title).toBe('Garcon-Amp initialized');
     expect(initialized[0].content).toBe(
-      `${bundledRoleDefaultsContent}\nCreated $HOME/.config/garcon-amp.conf with defaults\n`,
+      `${bundledDefaultSelection}\nCreated $HOME/.config/garcon-amp.conf with defaults\n`,
     );
 
     await writeFile(rowLogPath, '');
@@ -1552,27 +1704,62 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     );
 
     await writeFile(rowLogPath, '');
-    const userDefaults = 'oracle=codex:user-default:high\n';
+    const userDefaults = [
+      'oracle=codex:user-default:high',
+      `finder=${bundledRoleDefaults.finder}`,
+      `librarian=${bundledRoleDefaults.librarian}`,
+      `reporter=${bundledRoleDefaults.reporter}`,
+      '',
+    ].join('\n');
     await writeFile(defaultsPath, userDefaults);
     const preserved = await run([setupPath, chatId], { env: { HOME: configuredHome } });
     expect(preserved.exitCode).toBe(0);
-    expect(await readFile(defaultsPath, 'utf8')).toBe(userDefaults);
+    expect(await readFile(defaultsPath, 'utf8')).toBe([
+      'default-profile=default',
+      '',
+      '[profile:default]',
+      'oracle=codex:user-default:high',
+      `finder=${bundledRoleDefaults.finder}`,
+      `librarian=${bundledRoleDefaults.librarian}`,
+      `reporter=${bundledRoleDefaults.reporter}`,
+      '',
+    ].join('\n'));
     const preservedNotices = await setupNoticeRows();
     expect(preservedNotices).toHaveLength(1);
     expect(preservedNotices[0]).toMatchObject({
       title: 'Garcon-Amp re-initialized',
-      content: 'No changes\n',
+      content: [
+        'Spec aliases changed',
+        '',
+        'Upgraded $HOME/.config/garcon-amp.conf to [profile:default]',
+        '',
+      ].join('\n'),
     });
   });
 
   test('rejects malformed home defaults before creating active state', async () => {
+    const defaultProfile = (
+      overrides: Partial<Record<(typeof ROLE_NAMES)[number], string>>,
+      extra: string[] = [],
+    ) => [
+      '[profile:default]',
+      `oracle=${overrides.oracle ?? 'codex:model:high'}`,
+      `finder=${overrides.finder ?? 'codex:model:low'}`,
+      `librarian=${overrides.librarian ?? 'codex:model:minimal'}`,
+      `reporter=${overrides.reporter ?? 'codex:model:high'}`,
+      ...extra,
+      '',
+    ].join('\n');
     const cases = [
       ['unknown=codex:model:high\n', 'unknown specialist role'],
-      ['oracle=codex:model:high\noracle=claude:model:low\n', 'duplicate oracle role default'],
+      ['oracle=codex:model:high\noracle=claude:model:low\n', 'expected finder=<spec>'],
       ['oracle codex:model:high\n', 'expected <specialist-role>=<spec>'],
-      ['oracle=codex:model:high,,claude:model:low\n', 'empty entry'],
-      ['oracle=codex:model:high,codex:model:high\n', 'duplicate'],
-      ['finder=codex:model:high,claude:model:low\n', 'only oracle may configure multiple'],
+      [defaultProfile({ oracle: 'codex:model:high,,claude:model:low' }), 'empty entry'],
+      [defaultProfile({ oracle: 'codex:model:high,codex:model:high' }), 'duplicate'],
+      [
+        defaultProfile({ finder: 'codex:model:high,claude:model:low' }),
+        'only oracle may configure multiple',
+      ],
       ['spec-alias:codex=codex:model:high\n', 'reserved spec alias name'],
       [
         'spec-alias:same=codex:model:high\nspec-alias:same=claude:model:high\n',
@@ -1582,11 +1769,14 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       ['spec-alias:nested=another-alias\n', 'spec alias target must be'],
       ['spec-alias:bad=codex:model:turbo\n', 'spec alias target must be'],
       [
-        'oracle=short\nspec-alias:short=codex:model\n',
+        defaultProfile({ oracle: 'short' }, ['spec-alias:short=codex:model']),
         'alias "short" resolved to "codex:model"',
       ],
       [
-        'oracle=same,codex:model:high\nspec-alias:same=codex:model:high\n',
+        defaultProfile(
+          { oracle: 'same,codex:model:high' },
+          ['spec-alias:same=codex:model:high'],
+        ),
         'duplicate after alias resolution',
       ],
       [
@@ -1595,8 +1785,44 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       ],
       [
         '[profile:default]\n',
-        'the default profile must use unprefixed role assignments',
+        'expected oracle=<spec>',
       ],
+      [[
+        '[profile:default]',
+        'oracle=codex:model:high',
+        'finder=codex:model:low',
+        'librarian=codex:model:minimal',
+        'reporter=codex:model:high',
+        'oracle=codex:legacy:high',
+        '',
+      ].join('\n'), 'legacy unprefixed roles cannot be combined with [profile:default]'],
+      [[
+        '[profile:default]',
+        'oracle=codex:model:high',
+        'finder=codex:model:low',
+        'librarian=codex:model:minimal',
+        'reporter=codex:model:high',
+        '[profile:default]',
+        'oracle=claude:model:high',
+        'finder=claude:model:low',
+        'librarian=claude:model:medium',
+        'reporter=claude:model:high',
+        '',
+      ].join('\n'), 'duplicate profile "default"'],
+      [[
+        'default-profile=default',
+        'oracle=codex:model:high',
+        'finder=codex:model:low',
+        'librarian=codex:model:minimal',
+        'reporter=codex:model:high',
+        '',
+      ].join('\n'), 'legacy unprefixed roles cannot be combined with default-profile'],
+      ['default-profile=.hidden\n', 'invalid default profile'],
+      [
+        'default-profile=medium\ndefault-profile=ultra\n',
+        'duplicate default profile',
+      ],
+      ['default-profile=missing\n', 'unknown profile: missing'],
       [
         '[profile:.hidden]\n',
         'invalid profile name',
@@ -1736,6 +1962,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     expect(changeRetryNotices).toHaveLength(1);
     expect(changeRetryNotices[0].title).toBe('Garcon-Amp re-initialized');
     expect(changeRetryNotices[0].content).toBe([
+      `base-profile=${bundledDefaultProfile}`,
       'oracle=codex:notice-retry:high',
       `finder=${bundledRoleDefaults.finder}`,
       `librarian=${bundledRoleDefaults.librarian}`,
@@ -2064,19 +2291,44 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       {
         label: 'incomplete',
         mutate: async (defaultsPath) => {
-          await writeFile(defaultsPath, `oracle=${bundledRoleDefaults.oracle}\n`);
+          await writeFile(defaultsPath, [
+            'default-profile=default',
+            '[profile:default]',
+            `oracle=${bundledRoleDefaults.oracle}`,
+            '',
+          ].join('\n'));
         },
-        message: 'bundled role default is missing finder',
+        message: 'expected finder=<spec>',
       },
       {
         label: 'invalid',
         mutate: async (defaultsPath) => {
           await writeFile(defaultsPath, bundledRoleDefaultsContent.replace(
-            `oracle=${bundledRoleDefaults.oracle}`,
-            `oracle=${bundledRoleDefaults.oracle}:`,
+            bundledDefaultOracleAssignment,
+            `${bundledDefaultOracleAssignment}:`,
           ));
         },
         message: 'invalid oracle bundled role default',
+      },
+      {
+        label: 'unknown-default-profile',
+        mutate: async (defaultsPath) => {
+          await writeFile(defaultsPath, bundledRoleDefaultsContent.replace(
+            `default-profile=${bundledDefaultProfile}`,
+            'default-profile=missing',
+          ));
+        },
+        message: 'selects unknown default profile "missing"',
+      },
+      {
+        label: 'unprefixed-default',
+        mutate: async (defaultsPath) => {
+          await writeFile(defaultsPath, [
+            ...ROLE_NAMES.map((role) => `${role}=${bundledRoleDefaults[role]}`),
+            '',
+          ].join('\n'));
+        },
+        message: 'unprefixed role assignments are not allowed in bundled role default',
       },
       {
         label: 'incomplete-profile',
@@ -3616,6 +3868,11 @@ describe('generated adapters', () => {
     expect((await setup(chatId)).exitCode).toBe(0);
     const launcher = path.join(statePath, 'oracle');
     const primarySpec = 'claude:primary-reviewer:xhigh';
+    const reviewerSpecs = [
+      primarySpec,
+      'codex:second-reviewer:max',
+      'pi:runtime-provider:third-reviewer:high',
+    ];
     const prompt = 'Cross-check this critical change with three reviewers.';
 
     const started = await run([
@@ -3625,10 +3882,10 @@ describe('generated adapters', () => {
       '--spec',
       primarySpec,
       '--spec',
-      'codex:second-reviewer:max',
+      reviewerSpecs[1],
       '--review',
       '--spec',
-      'pi:runtime-provider:third-reviewer:high',
+      reviewerSpecs[2],
       prompt,
     ], {
       env: {
@@ -3657,10 +3914,7 @@ describe('generated adapters', () => {
     expect(agentCalls.every((call) => policyPrompt(call).includes('# Completed-diff review protocol'))).toBe(true);
 
     const aggregate = [
-      'Reviewer roster (launcher-authored; reviewer bodies may contain arbitrary headings):',
-      '1. Reviewer 1',
-      '2. Reviewer 2',
-      '3. Reviewer 3',
+      '3 reviewer results.',
       '',
       '## Reviewer 1',
       '',
@@ -3680,17 +3934,21 @@ describe('generated adapters', () => {
     const rows = await rowCalls();
     expect(rows).toHaveLength(2);
     expect(rows[0]).toMatchObject({
-      title: `Oracle review request (async, 3 reviewers) [primary: ${primarySpec}]`,
+      title: expectedTranscriptTitle('Oracle review request (async)', reviewerSpecs),
       content: prompt,
     });
     expect(rows[1]).toMatchObject({
-      messageTitle: `Oracle review response (async, 3 reviewers) [primary: ${primarySpec}]`,
+      messageTitle: expectedTranscriptTitle('Oracle review response (async)', reviewerSpecs),
       color: roleAccents.Oracle,
       collapsible: true,
     });
+    expect(rows.every((row) => !(row.title ?? row.messageTitle).includes('(async,'))).toBe(true);
+    expect(rows.every((row) => !(row.title ?? row.messageTitle).includes('primary:'))).toBe(true);
     expect(rows[1].content).toBe(
       resultEnvelope('oracle', finished.runId, aggregate),
     );
+    expect(rows[1].content).not.toContain('Reviewer roster');
+    expect(rows[1].content).not.toContain('1. Reviewer 1');
     const runLog = await readFile(path.join(statePath, '.oracle.run.log'), 'utf8');
     expect(runLog).toContain('reviewer 2 diagnostics:');
     expect(runLog).not.toContain('codex:second-reviewer:max');
@@ -3745,8 +4003,8 @@ describe('generated adapters', () => {
     });
     expect(await calls()).toHaveLength(3);
     expect((await rowCalls()).map((row) => row.title)).toEqual([
-      `Oracle request (3 reviewers) [primary: ${reviewers[0]}]`,
-      `Oracle response (3 reviewers) [primary: ${reviewers[0]}]`,
+      expectedTranscriptTitle('Oracle request (3 reviewers)', reviewers),
+      expectedTranscriptTitle('Oracle response (3 reviewers)', reviewers),
     ]);
 
     await writeFile(logPath, '');
@@ -3756,8 +4014,8 @@ describe('generated adapters', () => {
     });
     expect(partial.exitCode).toBe(0);
     expect((await rowCalls()).map((row) => row.title)).toEqual([
-      `Oracle request (3 reviewers) [primary: ${reviewers[0]}]`,
-      `Oracle response (2 of 3 reviewers) [primary: ${reviewers[0]}]`,
+      expectedTranscriptTitle('Oracle request (3 reviewers)', reviewers),
+      expectedTranscriptTitle('Oracle response (2 of 3 reviewers)', reviewers),
     ]);
   });
 
@@ -3802,6 +4060,7 @@ describe('generated adapters', () => {
       ? 'codex:configured-second:high'
       : 'claude:configured-second:high';
     const appendedSpec = 'opencode:runtime-provider:appended-reviewer:high';
+    const reviewerSpecs = [configuredSpec, secondConfiguredSpec, appendedSpec];
     expect((await setup(chatId, [
       '--oracle', configuredSpec,
       '--oracle', secondConfiguredSpec,
@@ -3825,10 +4084,7 @@ describe('generated adapters', () => {
 
     const aggregate = await readFile(path.join(statePath, '.oracle.last-response'), 'utf8');
     expect(aggregate).toBe([
-      'Reviewer roster (launcher-authored; reviewer bodies may contain arbitrary headings):',
-      '1. Reviewer 1',
-      '2. Reviewer 2',
-      '3. Reviewer 3',
+      '3 reviewer results.',
       '',
       '## Reviewer 1',
       '',
@@ -3846,10 +4102,10 @@ describe('generated adapters', () => {
 
     const rows = await rowCalls();
     expect(rows[0].title).toBe(
-      `Oracle request (async, 3 reviewers) [primary: ${configuredSpec}]`,
+      expectedTranscriptTitle('Oracle request (async)', reviewerSpecs),
     );
     expect(rows[1].messageTitle).toBe(
-      `Oracle response (async, 3 reviewers) [primary: ${configuredSpec}]`,
+      expectedTranscriptTitle('Oracle response (async)', reviewerSpecs),
     );
   });
 
@@ -3909,14 +4165,14 @@ describe('generated adapters', () => {
       .toEqual(new Set(['opencode', 'codex']));
     const asyncRows = await rowCalls();
     expect(asyncRows[0].title).toBe(
-      `Oracle request (async, 2 reviewers) [primary: ${resolvedPrimary}]`,
+      expectedTranscriptTitle('Oracle request (async)', [resolvedPrimary, resolvedSecondary]),
     );
     expect(asyncRows[1].messageTitle).toBe(
-      `Oracle response (async, 2 reviewers) [primary: ${resolvedPrimary}]`,
+      expectedTranscriptTitle('Oracle response (async)', [resolvedPrimary, resolvedSecondary]),
     );
     for (const row of asyncRows) {
-      expect(row.title ?? row.messageTitle).not.toContain('[primary: oa:max]');
-      expect(row.title ?? row.messageTitle).not.toContain(resolvedSecondary);
+      expect(row.title ?? row.messageTitle).not.toContain('oa:max');
+      expect(row.title ?? row.messageTitle).toContain(resolvedSecondary);
     }
 
     await writeFile(logPath, '');
@@ -3977,6 +4233,7 @@ describe('generated adapters', () => {
     expect((await setup(chatId)).exitCode).toBe(0);
     const launcher = path.join(statePath, 'oracle');
     const primarySpec = 'claude:successful-primary:xhigh';
+    const reviewerSpecs = [primarySpec, 'codex:failing-reviewer:high'];
 
     expect((await run([
       launcher,
@@ -3985,7 +4242,7 @@ describe('generated adapters', () => {
       '--spec',
       primarySpec,
       '--spec',
-      'codex:failing-reviewer:high',
+      reviewerSpecs[1],
       'Preserve successful reviews and identify reviewer failures.',
     ], {
       env: {
@@ -4015,7 +4272,7 @@ describe('generated adapters', () => {
     expect(aggregate).not.toContain('codex:failing-reviewer:high');
     const callback = (await rowCalls()).at(-1);
     expect(callback).toMatchObject({
-      messageTitle: `Oracle response (async, 1 of 2 reviewers) [primary: ${primarySpec}]`,
+      messageTitle: expectedTranscriptTitle('Oracle response (async)', reviewerSpecs),
       color: roleAccents.Oracle,
     });
     expect(callback.messageStyle).toBeUndefined();
@@ -4056,7 +4313,15 @@ describe('generated adapters', () => {
       `## Reviewer 2\n\n${mockAgentOutcomes[successfulAgent].response.trimEnd()}`,
     );
     const runLog = await readFile(path.join(statePath, '.oracle.run.log'), 'utf8');
-    const callback = (await rowCalls()).at(-1);
+    const rows = await rowCalls();
+    const callback = rows.at(-1);
+    const reviewerSpecs = [configuredSpec, successfulSpec];
+    expect(rows[0].title).toBe(
+      expectedTranscriptTitle('Oracle request (async)', reviewerSpecs),
+    );
+    expect(callback.messageTitle).toBe(
+      expectedTranscriptTitle('Oracle response (async)', reviewerSpecs),
+    );
     for (const surface of [aggregate, runLog, callback.content]) {
       expect(surface).not.toContain(configuredSpec);
       expect(surface).not.toContain(successfulSpec);
@@ -4070,15 +4335,16 @@ describe('generated adapters', () => {
     const { chatId, statePath } = newChatId();
     expect((await setup(chatId)).exitCode).toBe(0);
     const launcher = path.join(statePath, 'oracle');
+    const reviewerSpecs = ['codex:first-failure:high', 'codex:second-failure:max'];
 
     expect((await run([
       launcher,
       '--start',
       '--no-defaults',
       '--spec',
-      'codex:first-failure:high',
+      reviewerSpecs[0],
       '--spec',
-      'codex:second-failure:max',
+      reviewerSpecs[1],
       'Report a complete group failure.',
     ], {
       env: {
@@ -4102,7 +4368,7 @@ describe('generated adapters', () => {
     expect(aggregate.match(/Failed: reviewer exited 7/g)).toHaveLength(2);
     const callback = (await rowCalls()).at(-1);
     expect(callback).toMatchObject({
-      messageTitle: 'Oracle failed (async, 2 reviewers) [primary: codex:first-failure:high]',
+      messageTitle: expectedTranscriptTitle('Oracle failed (async)', reviewerSpecs),
       messageStyle: 'error',
       color: null,
     });
@@ -4120,6 +4386,7 @@ describe('generated adapters', () => {
     expect((await setup(chatId)).exitCode).toBe(0);
     const launcher = path.join(statePath, 'oracle');
     const primarySpec = 'claude:successful-primary:xhigh';
+    const reviewerSpecs = [primarySpec, 'codex:whitespace-reviewer:high'];
 
     expect((await run([
       launcher,
@@ -4128,7 +4395,7 @@ describe('generated adapters', () => {
       '--spec',
       primarySpec,
       '--spec',
-      'codex:whitespace-reviewer:high',
+      reviewerSpecs[1],
       'Reject an empty reviewer result.',
     ], {
       env: {
@@ -4147,7 +4414,7 @@ describe('generated adapters', () => {
       '## Reviewer 2\n\nFailed: reviewer exited 1.',
     );
     expect((await rowCalls()).at(-1).messageTitle)
-      .toBe(`Oracle response (async, 1 of 2 reviewers) [primary: ${primarySpec}]`);
+      .toBe(expectedTranscriptTitle('Oracle response (async)', reviewerSpecs));
   });
 
   test('uses the extensionless CLI entry point under the supplied Garcon root', async () => {
@@ -5062,14 +5329,19 @@ describe('generated adapters', () => {
     const { chatId, statePath } = newChatId();
     expect((await setup(chatId)).exitCode).toBe(0);
     const launcher = path.join(statePath, 'oracle');
+    const reviewerSpecs = [
+      defaultRoleSpecs.Oracle,
+      'codex:slow-secondary:high',
+      'pi:runtime-provider:slow-third:high',
+    ];
 
     const started = await run([
       launcher,
       '--start',
       '--spec',
-      'codex:slow-secondary:high',
+      reviewerSpecs[1],
       '--spec',
-      'pi:runtime-provider:slow-third:high',
+      reviewerSpecs[2],
       'Keep every reviewer active until killed.',
     ], {
       env: {
@@ -5091,7 +5363,7 @@ describe('generated adapters', () => {
     expect(statusField(killed.stdout, 'status')).toBe('killed');
     expect(statusField(killed.stdout, 'reviewers')).toBe('3');
     expect((await rowCalls()).map((row) => row.title)).toEqual([
-      `Oracle request (async, 3 reviewers) [primary: ${defaultRoleSpecs.Oracle}]`,
+      expectedTranscriptTitle('Oracle request (async)', reviewerSpecs),
     ]);
     for (const call of reviewerCalls) {
       let alive = true;

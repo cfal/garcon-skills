@@ -16,12 +16,14 @@ Treat these rules as non-negotiable:
 - Use Oracle for consequential reasoning, target-repository causal diagnosis and affected-surface synthesis, and completed-diff review; Finder only for retrieval inside the task's target repositories; Librarian for material external evidence across upstream repositories, GitHub, published documentation, standards, registries, and prior art; Reporter for goal-directed extraction across supplied transcript sources; and the parent for implementation.
 - Make the smallest correct change. Continue through focused validation and repair until the goal is achieved or a genuine blocker requires new user authority, information, or a materially different choice. Do not stop at a plan, consultation, partial implementation, or first failing check.
 
-## Activate or rehydrate
+## Setup
 
-Setup requires a Garcon chat ID disclosed for the current activation. Each fork or new parent-agent run begins an activation. Steering, its direct-control continuation, and mid-run compaction stay inside it.
+Setup requires your Garcon chat ID. Each fork or new parent-agent run begins an activation. Steering, its direct-control continuation, and compaction stay inside it.
 
-1. Before an activation, place exactly `<garcon-get-chat-id />` at a message's beginning or end. It must touch that edge; after prose, put it on a new line. Other content may appear only on the other side, and the turn may continue.
-2. Garcon first steers the emitting run; if unavailable, it starts one direct control run. Do not delay or poll; continue only setup-independent work. If neither resumes, do not run setup.
+**Never assume or re-use the chat ID. Always follow this protocol.**
+
+1. Before **every** setup, place `<garcon-get-chat-id />` on its own line at a message's beginning or end. It must touch that edge; after prose, put it on a new line. Other content may appear only on the other side, and the turn may continue.
+2. Garcon will respond with the ID at the next opportunity. Do not delay or poll; continue only setup-independent work. If neither resumes, do not run setup.
 3. Accept only input equal to `<garcon-chat-id>[0-9]+</garcon-chat-id>` at a message's beginning or end. Use this activation's disclosure for only this setup. After a fork or new activation, ignore inherited disclosures, chat IDs, and packets and request again. Never derive an ID from host state, tools, files, searches, sandbox paths, or specialist output. Without one, do not run setup.
 
 `--garcon-path` is optional and explicitly selects a Garcon repository, overriding discovery. Without a prior selection, setup uses `garcon-cli` on `PATH`, then a valid repository at `$HOME/garcon`, then `/garcon`. Reruns preserve the recorded CLI source. If none resolves, stop and ask the user for the Garcon path. On first setup, run from this skill directory:
@@ -62,6 +64,6 @@ Rerun setup before an activation's first specialist use, after mid-run compactio
 ./garcon-amp-setup <garcon-chat-id> [--profile <name>] [--reset-defaults]
 ```
 
-Reruns preserve the omitted Garcon CLI source, resolved role selections, base-profile provenance, and shared sandbox. `--profile` reapplies that named snapshot without resetting the sandbox; `--reset-defaults` selects `default` and resets roles and sandbox before explicit overrides. Every successful setup prints the complete runtime supplement. Initialization publishes selected resolved specs. Every successful rerun publishes `Garcon-Amp re-initialized`, confirming the chat ID; its body contains changed profile provenance and role specs, `Spec aliases changed` for an alias-only update, or `No changes`. If publication fails, setup exits 2 without printing the packet or changing active config and installation state. Role specs remain absent from the runtime packet.
+Reruns preserve the omitted Garcon CLI source, resolved role selections, base-profile provenance, and shared sandbox. `--profile` reapplies that exact named snapshot without resetting the sandbox; `--reset-defaults` selects the profile named by `default-profile=<name>` and resets roles and sandbox before explicit overrides. `[profile:default]` is valid; legacy unprefixed role assignments remain equivalent and are upgraded immediately by inserting `default-profile=default` and `[profile:default]`. Every successful setup prints the complete runtime supplement. Initialization publishes selected resolved specs. Every successful rerun publishes `Garcon-Amp re-initialized`, confirming the chat ID; its body contains changed profile provenance and role specs, `Spec aliases changed` for an alias-only update, or `No changes`. If publication fails, setup exits 2 without printing the packet or changing active config and installation state. Role specs remain absent from the runtime packet.
 
 Once a complete packet has been read, choose and invoke specialists autonomously under that contract. Do not ask permission solely to consult a useful specialist.

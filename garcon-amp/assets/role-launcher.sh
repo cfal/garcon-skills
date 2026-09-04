@@ -74,7 +74,6 @@ reviewer_child_pids=()
 reviewer_count=1
 reviewer_success_count=1
 run_outcome=finished
-async_title_detail=async
 group_title_detail=''
 
 enable_review() {
@@ -411,8 +410,9 @@ if [[ "$mode" != status && "$mode" != kill ]]; then
   TITLE_SPEC_LABEL=$PRIMARY_SPEC
   if (( reviewer_count > 1 )); then
     group_title_detail="$reviewer_count reviewers"
-    async_title_detail+=", $group_title_detail"
-    TITLE_SPEC_LABEL="primary: $PRIMARY_SPEC"
+    for spec in "${reviewer_specs[@]:1}"; do
+      TITLE_SPEC_LABEL+=", $spec"
+    done
   fi
 
   for spec in "${reviewer_specs[@]}"; do
@@ -785,14 +785,10 @@ send_callback() {
   elapsed="$(format_elapsed "$(( EPOCHSECONDS - ${run_state[startedAt]:-$EPOCHSECONDS} ))")"
   run_id="${run_state[runId]:-unknown}"
   if (( status == 0 )); then
-    if [[ "$run_outcome" == partial ]]; then
-      callback_title="$ROLE_ACTIVITY_TITLE response (async, $reviewer_success_count of $reviewer_count reviewers)"
-    else
-      callback_title="$ROLE_ACTIVITY_TITLE response ($async_title_detail)"
-    fi
+    callback_title="$ROLE_ACTIVITY_TITLE response (async)"
     callback_presentation=(--color "$ROLE_ACCENT")
   else
-    callback_title="$ROLE_ACTIVITY_TITLE failed ($async_title_detail)"
+    callback_title="$ROLE_ACTIVITY_TITLE failed (async)"
     callback_presentation=(--message-style error)
   fi
   callback_title="$(title_with_spec "$callback_title")"
@@ -1124,7 +1120,7 @@ try {
 
 request_title="$ROLE_ACTIVITY_TITLE request"
 if [[ "$mode" == detached ]]; then
-  request_title+=" ($async_title_detail)"
+  request_title+=' (async)'
 elif [[ -n "$group_title_detail" ]]; then
   request_title+=" ($group_title_detail)"
 fi
@@ -1595,12 +1591,16 @@ run_oracle_group() {
   done
 
   : >"$RESPONSE_FILE"
-  printf 'Reviewer roster (launcher-authored; reviewer bodies may contain arbitrary headings):\n' \
-    >>"$RESPONSE_FILE"
-  for index in "${!reviewer_specs[@]}"; do
-    printf '%s. Reviewer %s\n' "$((index + 1))" "$((index + 1))" >>"$RESPONSE_FILE"
-  done
-  printf '\n' >>"$RESPONSE_FILE"
+  if [[ "$mode" == detached ]]; then
+    printf '%s reviewer results.\n\n' "$reviewer_count" >>"$RESPONSE_FILE"
+  else
+    printf 'Reviewer roster (launcher-authored; reviewer bodies may contain arbitrary headings):\n' \
+      >>"$RESPONSE_FILE"
+    for index in "${!reviewer_specs[@]}"; do
+      printf '%s. Reviewer %s\n' "$((index + 1))" "$((index + 1))" >>"$RESPONSE_FILE"
+    done
+    printf '\n' >>"$RESPONSE_FILE"
+  fi
 
   for index in "${!reviewer_specs[@]}"; do
     status=${child_statuses[index]}

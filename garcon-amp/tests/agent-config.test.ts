@@ -58,19 +58,36 @@ describe('agent specifications', () => {
     }
   });
 
-  test('keeps packaged role defaults canonical and in registry order', () => {
+  test('keeps packaged profiles valid and in registry order', () => {
     expect(ROLE_NAMES).toEqual(['oracle', 'finder', 'librarian', 'reporter']);
-    const assignments = bundledDefaults.trimEnd().split('\n').map((assignment) => {
-      const separator = assignment.indexOf('=');
-      return {
-        role: assignment.slice(0, separator),
-        spec: assignment.slice(separator + 1),
-      };
-    });
-    expect(assignments).toHaveLength(ROLE_NAMES.length);
-    expect(assignments.map(({ role }) => role)).toEqual(ROLE_NAMES);
-    for (const { spec } of assignments) {
-      expect(canonicalAgentSpec(parseAgentSpec(spec))).toBe(spec);
+    const lines = bundledDefaults.trimEnd().split('\n');
+    const aliases = new Map(lines
+      .filter((line) => line.startsWith('spec-alias:'))
+      .map((line) => {
+        const separator = line.indexOf('=');
+        const name = line.slice('spec-alias:'.length, separator);
+        return [name, parseSpecAliasTarget(line.slice(separator + 1))];
+      }));
+    const defaultProfile = lines.find((line) => line.startsWith('default-profile='))
+      ?.slice('default-profile='.length);
+    const profileHeaders = lines
+      .map((line, index) => line.startsWith('[profile:') ? index : -1)
+      .filter((index) => index !== -1);
+
+    expect(defaultProfile).toBe('medium');
+    expect(profileHeaders).toHaveLength(2);
+    expect(lines).toContain(`[profile:${defaultProfile}]`);
+    for (const headerIndex of profileHeaders) {
+      const assignments = ROLE_NAMES.map((role, index) => {
+        const assignment = lines[headerIndex + index + 1];
+        const prefix = `${role}=`;
+        expect(assignment.startsWith(prefix)).toBe(true);
+        return { role, spec: assignment.slice(prefix.length) };
+      });
+      expect(assignments.map(({ role }) => role)).toEqual(ROLE_NAMES);
+      for (const { spec } of assignments) {
+        expect(canonicalAgentSpecList(parseAgentSpecList(spec, aliases))).not.toBe('');
+      }
     }
   });
 

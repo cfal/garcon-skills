@@ -114,25 +114,19 @@ describe('skill activation protocol', () => {
     expect(askIndex).toBeGreaterThan(rootIndex);
   });
 
-  test('keeps default unprefixed and selects complete named profiles explicitly', () => {
+  test('selects configured profiles while preserving legacy default syntax', () => {
     for (const requiredPhrase of [
       '[--profile <name>]',
-      'Unprefixed `<role>=<spec-or-alias>` lines define the reserved `default` profile',
-      'Named profiles use exactly this five-line form',
-      '[profile:<name>]\noracle=<spec-or-alias>\nfinder=<spec-or-alias>\nlibrarian=<spec-or-alias>\nreporter=<spec-or-alias>',
-      'no blank or unrelated lines inside the block',
-      'Parsing resumes normally after `reporter`',
-      'Fresh setup and `--reset-defaults` use `default`',
-      'apply `--profile <name>` only when the user selects it',
-      'never by inferring task difficulty',
-      'It replaces the whole role bundle',
-      'then explicit role flags override it',
-      'Established chats preserve resolved snapshots',
+      '`--profile` reapplies that exact named snapshot',
+      '`--reset-defaults` selects the profile named by `default-profile=<name>`',
+      '`[profile:default]` is valid',
+      'legacy unprefixed role assignments remain equivalent',
+      'upgraded immediately',
+      'inserting `default-profile=default` and `[profile:default]`',
     ]) {
       expect(skill).toContain(requiredPhrase);
     }
     expect(skill).not.toContain('profile:<name>.<role>=');
-    expect(skill).not.toContain('default-profile=');
   });
 
   test('matches installed Garcon protocol constants when available', async () => {
