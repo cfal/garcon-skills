@@ -60,14 +60,18 @@ describe('agent specifications', () => {
 
   test('keeps packaged profiles valid and in registry order', () => {
     expect(ROLE_NAMES).toEqual(['oracle', 'finder', 'librarian', 'reporter']);
-    const lines = bundledDefaults.trimEnd().split('\n');
-    const aliases = new Map(lines
-      .filter((line) => line.startsWith('spec-alias:'))
-      .map((line) => {
-        const separator = line.indexOf('=');
-        const name = line.slice('spec-alias:'.length, separator);
-        return [name, parseSpecAliasTarget(line.slice(separator + 1))];
-      }));
+    const lines = bundledDefaults.trimEnd().split('\n')
+      .filter((line) => !/^[\t ]*#/.test(line));
+    const aliasHeader = lines.indexOf('[spec-alias]');
+    expect(aliasHeader).toBeGreaterThanOrEqual(0);
+    const aliases = new Map<string, string>();
+    for (let index = aliasHeader + 1; index < lines.length && lines[index]; index++) {
+      const separator = lines[index].indexOf('=');
+      aliases.set(
+        lines[index].slice(0, separator),
+        parseSpecAliasTarget(lines[index].slice(separator + 1)),
+      );
+    }
     const defaultProfile = lines.find((line) => line.startsWith('default-profile='))
       ?.slice('default-profile='.length);
     const profileHeaders = lines

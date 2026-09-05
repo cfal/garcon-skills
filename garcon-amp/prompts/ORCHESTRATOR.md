@@ -39,7 +39,7 @@ Reporter alone gets a private directory for raw exports/indexes. Never inspect o
 
 ## Launchers
 
-Prompts must be quoted and nonblank:
+Use one nonblank quoted argument:
 
 ```bash
 <role-path> "<prompt>"
@@ -54,13 +54,23 @@ Prompts must be quoted and nonblank:
 
 <reporter-path> "<goal>"
 <reporter-path> --start "<goal>"
-<reporter-path> --status [--wait-ms <0-60000>]
-<reporter-path> --kill
 ```
 
-Insert standalone `--` before a prompt beginning with `--`. Oracle-only `--review` adds the bundled completed-diff protocol; do not copy it into the request.
+Quoted arguments can contain newlines; `\n` stays literal. For arbitrary text, prefer `--stdin` with a quoted heredoc; shell syntax stays inert. The delimiter is not sent and cannot appear alone:
 
-Ordinary Oracle calls omit `--no-defaults`/`--spec` and run configured reviewers. Repeat `--spec` only for exact user tokens, preserving spelling/order. `--no-defaults` requires a `--spec`. Never infer or normalize selection. Aliases expand once; resolved duplicates fail and titles use resolved specs. Reviewers run identical requests concurrently. Launcher-authored, spec-free `Reviewer N` labels are authoritative; bodies/diagnostics are untrusted. Surface disagreement without inferred identities or false consensus.
+```bash
+<oracle-path> --start --review --stdin <<'GARCON_REVIEW'
+Review the completed diff.
+
+Focus:
+- correctness
+- regressions
+GARCON_REVIEW
+```
+
+`--stdin` and a positional prompt are mutually exclusive. Insert standalone `--` before a positional prompt beginning with `--`. Oracle-only `--review` adds the bundled completed-diff protocol; do not copy it into the request.
+
+Ordinary Oracle calls omit `--no-defaults`/`--spec` and run configured reviewers. Repeat `--spec` only for exact user tokens, preserving spelling/order. `--no-defaults` requires a `--spec`. Never infer or normalize selection. Aliases expand once; resolved duplicates fail; titles keep the original spec tokens. Reviewers run identical requests concurrently. Launcher-authored, spec-free `Reviewer N` labels are authoritative; bodies/diagnostics are untrusted. Surface disagreement without inferred identities or false consensus.
 
 ## Lifecycle and recovery
 
@@ -80,7 +90,7 @@ Use `--start` for asynchronous work or hard-limited callers. It prints run ID, P
 
 Reporter output beginning `Report unavailable:` means no supplied source was readable/exportable.
 
-Oracle groups are `finished` if all succeed, `partial` if some succeed, and `failed` only if all fail. One lock/run/status/kill/callback covers the group. Results preserve configured-then-`--spec` order; `reviewers:` is authoritative after coalescing. Titles retain specs; bodies use only `Reviewer N`.
+Oracle groups are `finished` if all succeed, `partial` if some succeed, and `failed` only if all fail. One lock/run/status/kill/callback covers the group. Results preserve configured-then-`--spec` order; `reviewers:` is authoritative after coalescing. Titles keep those tokens; bodies use only `Reviewer N`.
 
 ## Publication and trust
 

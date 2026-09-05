@@ -16,6 +16,7 @@ import {
 import {
   canonicalAgentSpec,
   canonicalAgentSpecList,
+  parseAgentSpec,
   parseAgentSpecList,
   parseAgentSpecWithAliases,
   parseSpecAliasName,
@@ -104,11 +105,13 @@ Bundled defaults (defaults.conf):
   librarian=${bundledRoleDefaults.librarian}
   reporter=${bundledRoleDefaults.reporter}
 
-User profile/default file:
+User profile/default files (first existing file wins):
+  $HOME/.garcon/garcon-amp.conf
   $HOME/.config/garcon-amp.conf
 
-Setup creates this file with the bundled configuration when it is missing. Profiles
-use exactly this five-line form, with no blank or unrelated lines inside the block:
+When neither exists, setup creates $HOME/.garcon/garcon-amp.conf with the bundled
+configuration. Profiles use one header followed by four ordered assignments, with
+no blank or unrelated non-comment lines inside the block:
 
   [profile:<name>]
   oracle=<spec-or-alias>
@@ -122,11 +125,19 @@ role assignments are equivalent to [profile:default]. They are immediately upgra
 by inserting default-profile=default and [profile:default]; pre-existing selector or
 default-block mixtures fail. Names match [A-Za-z0-9][A-Za-z0-9._-]* and are
 case-sensitive; a complete user profile replaces a packaged namesake as a whole.
-Oracle may use a comma-separated list. Alias lines use
-spec-alias:<name>=<agent-spec-prefix>; a target may omit only its final level.
-Aliases expand one exact first segment, once. --profile replaces the whole role
-bundle, then explicit role options override it. Established resolved roles remain
-preserved until explicitly changed, reselected, or reset to the configured default.
+Oracle may use a comma-separated list. Aliases use one contiguous section:
+
+  [spec-alias]
+  <name>=<agent-spec-prefix>
+
+The section ends at a blank line, another section, or EOF. A target may omit only
+its final level. Legacy spec-alias:<name>=... rows are immediately upgraded; mixing
+legacy rows with [spec-alias] fails. A line whose first non-space/tab character is #
+is ignored, including inside sections; # elsewhere is data, not an inline comment.
+Spaces or tabs around any = are ignored. Aliases expand one exact first segment, once.
+--profile replaces the whole role bundle, then explicit role options override it.
+Established resolved roles remain preserved until explicitly changed, reselected, or
+reset to the configured default.
 
 Every successful rerun validates the installation, publishes a re-initialized
 notice in the selected chat, and reprints its complete runtime instruction packet.
@@ -139,10 +150,12 @@ const instructionsEndMarker = 'GARCON-AMP INSTRUCTIONS END';
 const instructionsMaxBytes = 12 * 1024;
 const activeConfigFileName = 'garcon-amp.conf';
 const installationFileName = '.installation.json';
+const userRoleDefaultsRelativePaths = [
+  '.garcon/garcon-amp.conf',
+  '.config/garcon-amp.conf',
+];
 const initializationNoticeTitle = 'Garcon-Amp initialized';
 const reinitializationNoticeTitle = 'Garcon-Amp re-initialized';
-const roleDefaultsCreationNotice = 'Created $HOME/.config/garcon-amp.conf with defaults';
-const roleDefaultsUpgradeNotice = 'Upgraded $HOME/.config/garcon-amp.conf to [profile:default]';
 const noRoleChangesNotice = 'No changes';
 const specAliasesChangedNotice = 'Spec aliases changed';
 
@@ -166,51 +179,170 @@ function normalizeConfigLine(line) {
   return line.endsWith('\r') ? line.slice(0, -1) : line;
 }
 
+function trimConfigWhitespace(value) {
+  return value.replace(/^[\t ]+|[\t ]+$/g, '');
+}
+
+function isConfigComment(line) {
+  return /^[\t ]*#/.test(line);
+}
+
+function nextNonCommentLineIndex(lines, index) {
+  let nextIndex = index + 1;
+  while (isConfigComment(normalizeConfigLine(lines[nextIndex] ?? ''))) nextIndex += 1;
+  return nextIndex;
+}
+
+function parseConfigAssignment(line) {
+  const separator = line.indexOf('=');
+  if (separator === -1) return undefined;
+  return {
+    name: trimConfigWhitespace(line.slice(0, separator)),
+    value: trimConfigWhitespace(line.slice(separator + 1)),
+  };
+}
+
 function ensureTrailingNewline(content) {
   return content.endsWith('\n') ? content : `${content}\n`;
 }
 
-function renderLegacyUserConfigUpgrade(content, filePath) {
-  const rawLines = content.split('\n');
-  const lines = rawLines.map(normalizeConfigLine);
+function inspectLegacyUserConfig(rawLines) {
+  const legacyAliases = [];
+  let aliasSectionCount = 0;
+  let defaultProfileBlockExists = false;
+  let defaultProfileExists = false;
+  let inAliasSection = false;
+  let invalidLegacyAliasLine;
   let roleLineIndex = -1;
-  for (let index = 0; index < lines.length; index++) {
-    const line = lines[index];
-    if (/^\[profile:\S+\]$/.test(line)) {
-      index += ROLE_NAMES.length;
+
+  for (let index = 0; index < rawLines.length; index++) {
+    const line = normalizeConfigLine(rawLines[index]);
+    if (isConfigComment(line)) continue;
+    if (inAliasSection) {
+      if (trimConfigWhitespace(line) === '') {
+        inAliasSection = false;
+        continue;
+      }
+      if (!line.startsWith('[')) continue;
+      inAliasSection = false;
+    }
+
+    if (line === '[spec-alias]') {
+      aliasSectionCount += 1;
+      inAliasSection = true;
       continue;
     }
-    const separator = line.indexOf('=');
-    if (separator > 0 && ROLE_NAMES.includes(line.slice(0, separator))) {
+    if (/^\[profile:\S+\]$/.test(line)) {
+      if (line === `[profile:${defaultProfileName}]`) defaultProfileBlockExists = true;
+      for (let roleIndex = 0; roleIndex < ROLE_NAMES.length; roleIndex += 1) {
+        index = nextNonCommentLineIndex(rawLines, index);
+      }
+      continue;
+    }
+
+    const unindentedLine = line.replace(/^[\t ]+/, '');
+    if (unindentedLine.startsWith('spec-alias:')) {
+      const body = line.slice(0, line.length - unindentedLine.length)
+        + unindentedLine.slice('spec-alias:'.length);
+      if (trimConfigWhitespace(body) === '') {
+        invalidLegacyAliasLine ??= index + 1;
+        continue;
+      }
+      legacyAliases.push({
+        body,
+        index,
+      });
+      continue;
+    }
+    const assignment = parseConfigAssignment(line);
+    if (assignment === undefined) continue;
+    if (assignment.name === 'default-profile') defaultProfileExists = true;
+    if (roleLineIndex === -1 && ROLE_NAMES.includes(assignment.name)) {
       roleLineIndex = index;
-      break;
     }
   }
-  if (roleLineIndex === -1) return undefined;
-  if (lines.some((line) => line.startsWith('default-profile='))) {
+
+  return {
+    aliasSectionCount,
+    defaultProfileBlockExists,
+    defaultProfileExists,
+    invalidLegacyAliasLine,
+    legacyAliases,
+    roleLineIndex,
+  };
+}
+
+function renderLegacyUserConfigUpgrade(content, filePath) {
+  let rawLines = content.split('\n');
+  let inspection = inspectLegacyUserConfig(rawLines);
+  let aliasesUpgraded = false;
+  let profileUpgraded = false;
+
+  if (inspection.invalidLegacyAliasLine !== undefined) {
+    fail(
+      `invalid role default at ${filePath}:${inspection.invalidLegacyAliasLine}; `
+      + 'expected <specialist-role>=<spec>',
+    );
+  }
+  if (inspection.legacyAliases.length > 0) {
+    if (inspection.aliasSectionCount > 0) {
+      fail(
+        `legacy spec aliases cannot be combined with [spec-alias] in role default: ${filePath}`,
+      );
+    }
+    const legacyIndexes = new Set(inspection.legacyAliases.map(({ index }) => index));
+    const firstAliasIndex = inspection.legacyAliases[0].index;
+    const carriageReturn = rawLines[firstAliasIndex].endsWith('\r') ? '\r' : '';
+    const aliasAssignments = inspection.legacyAliases.map(({ body, index }) => {
+      const lineEnding = rawLines[index].endsWith('\r') ? '\r' : '';
+      return `${body}${lineEnding}`;
+    });
+    rawLines = rawLines.filter((_, index) => !legacyIndexes.has(index));
+    const aliasBlock = [
+      `[spec-alias]${carriageReturn}`,
+      ...aliasAssignments,
+    ];
+    const followingLine = rawLines[firstAliasIndex];
+    if (
+      followingLine !== undefined
+      && trimConfigWhitespace(normalizeConfigLine(followingLine)) !== ''
+      && !normalizeConfigLine(followingLine).startsWith('[')
+    ) {
+      aliasBlock.push(carriageReturn);
+    }
+    rawLines.splice(firstAliasIndex, 0, ...aliasBlock);
+    aliasesUpgraded = true;
+    inspection = inspectLegacyUserConfig(rawLines);
+  }
+
+  if (inspection.roleLineIndex === -1) {
+    return { content: rawLines.join('\n'), aliasesUpgraded, profileUpgraded };
+  }
+  if (inspection.defaultProfileExists) {
     fail(
       `legacy unprefixed roles cannot be combined with default-profile in role default: ${filePath}`,
     );
   }
-  if (lines.includes(`[profile:${defaultProfileName}]`)) {
+  if (inspection.defaultProfileBlockExists) {
     fail(
       `legacy unprefixed roles cannot be combined with [profile:default] in role default: ${filePath}`,
     );
   }
-  const carriageReturn = rawLines[roleLineIndex].endsWith('\r') ? '\r' : '';
+  const carriageReturn = rawLines[inspection.roleLineIndex].endsWith('\r') ? '\r' : '';
   rawLines.splice(
-    roleLineIndex,
+    inspection.roleLineIndex,
     0,
     `default-profile=default${carriageReturn}`,
     carriageReturn,
     `[profile:${defaultProfileName}]${carriageReturn}`,
   );
-  return rawLines.join('\n');
+  profileUpgraded = true;
+  return { content: rawLines.join('\n'), aliasesUpgraded, profileUpgraded };
 }
 
 async function upgradeLegacyUserConfig(content, filePath, identity) {
-  const upgradedContent = renderLegacyUserConfigUpgrade(content, filePath);
-  if (upgradedContent === undefined) return { content, wasUpgraded: false };
+  const upgrade = renderLegacyUserConfigUpgrade(content, filePath);
+  if (!upgrade.aliasesUpgraded && !upgrade.profileUpgraded) return upgrade;
   const current = await requireOwnedRegularFileIfPresent(filePath, 'role defaults file');
   let currentContent;
   try {
@@ -227,28 +359,29 @@ async function upgradeLegacyUserConfig(content, filePath, identity) {
     fail(`role defaults file changed during setup; rerun to use it: ${filePath}`);
   }
   try {
-    await atomicWrite(filePath, upgradedContent, current.mode & 0o777);
+    await atomicWrite(filePath, upgrade.content, current.mode & 0o777);
   } catch (error) {
     fail(`cannot upgrade role defaults file: ${filePath}: ${error.message}`);
   }
-  return { content: upgradedContent, wasUpgraded: true };
+  return upgrade;
 }
 
 function parseRawProfileBlock(lines, headerIndex, profileName, filePath, kind) {
   const assignments = {};
-  for (const [roleIndex, role] of ROLE_NAMES.entries()) {
-    const index = headerIndex + roleIndex + 1;
+  let index = headerIndex;
+  for (const role of ROLE_NAMES) {
+    index = nextNonCommentLineIndex(lines, index);
     const line = lines[index] ?? '';
-    const prefix = `${role}=`;
-    if (!line.startsWith(prefix) || line.length === prefix.length) {
+    const assignment = parseConfigAssignment(line);
+    if (assignment?.name !== role || assignment.value === '') {
       fail(
         `invalid profile "${profileName}" in ${kind} at ${filePath}:${index + 1}; `
         + `expected ${role}=<spec>`,
       );
     }
-    assignments[role] = { spec: line.slice(prefix.length), line: index + 1 };
+    assignments[role] = { spec: assignment.value, line: index + 1 };
   }
-  return assignments;
+  return { assignments, lastIndex: index };
 }
 
 function parseRawRoleAssignments(
@@ -294,6 +427,62 @@ function parseRawRoleAssignments(
   return specs;
 }
 
+function rawRoleSpecLabels(rawSpecs) {
+  return Object.fromEntries(ROLE_NAMES.flatMap((name) => {
+    const assignment = rawSpecs[name];
+    return assignment === undefined ? [] : [[name, assignment.spec]];
+  }));
+}
+
+function validateStoredSpecLabel(label, resolvedSpec) {
+  let canonicalLabel;
+  try {
+    canonicalLabel = canonicalAgentSpec(parseAgentSpec(label));
+  } catch {}
+  if (canonicalLabel !== undefined) {
+    if (canonicalLabel !== resolvedSpec) {
+      throw new Error('canonical spec label does not match its role spec');
+    }
+    return;
+  }
+
+  const separator = label.indexOf(':');
+  const name = separator === -1 ? label : label.slice(0, separator);
+  parseSpecAliasName(name);
+  if (separator !== -1) {
+    const level = label.slice(separator + 1);
+    if (!level || /[:,\u0000\r\n]/.test(level)) throw new Error('invalid spec alias level');
+  }
+}
+
+function parseStoredSpecLabels(rawLabels, specs, filePath, kind) {
+  const labels = { ...specs };
+  for (const name of ROLE_NAMES) {
+    const assignment = rawLabels[name];
+    if (assignment === undefined) continue;
+    const values = assignment.spec.split(',');
+    const resolvedSpecs = specs[name].split(',');
+    try {
+      if (values.some((value) => value === '')) {
+        throw new Error('spec label list contains an empty entry');
+      }
+      if (values.length !== resolvedSpecs.length) {
+        throw new Error('spec label count does not match the role spec count');
+      }
+      if (new Set(values).size !== values.length) {
+        throw new Error('spec label list contains a duplicate');
+      }
+      for (const [index, value] of values.entries()) {
+        validateStoredSpecLabel(value, resolvedSpecs[index]);
+      }
+    } catch (error) {
+      fail(`invalid ${name} spec label in ${kind} at ${filePath}:${assignment.line}: ${error.message}`);
+    }
+    labels[name] = assignment.spec;
+  }
+  return labels;
+}
+
 function requireProfile(profileName, config, filePath, kind) {
   const specs = config.profiles.get(profileName);
   if (specs === undefined) {
@@ -309,7 +498,9 @@ function parseConfigAssignments(
     allowAliases = false,
     allowBaseProfile = false,
     allowDefaultProfile = false,
+    allowLegacyAliases = false,
     allowProfiles = false,
+    allowSpecLabels = false,
     requireAll = false,
     resolveAliases = false,
     kind = 'role default',
@@ -317,14 +508,61 @@ function parseConfigAssignments(
 ) {
   const aliases = new Map();
   const rawSpecs = {};
+  const rawSpecLabels = {};
   const rawProfiles = new Map();
   const seen = new Set();
+  let aliasSectionSeen = false;
   let baseProfile;
   let defaultProfile;
+  let legacyAliasesSeen = false;
   const lines = content.split('\n').map(normalizeConfigLine);
+
+  const addSpecAlias = (name, target, lineNumber) => {
+    try {
+      parseSpecAliasName(name);
+      if (aliases.has(name)) throw new Error(`duplicate spec alias: ${name}`);
+      aliases.set(name, parseSpecAliasTarget(target));
+    } catch (error) {
+      fail(`invalid spec alias at ${filePath}:${lineNumber}: ${error.message}`);
+    }
+  };
+
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
-    if (!line.trim()) continue;
+    if (!line.trim() || isConfigComment(line)) continue;
+
+    if (line === '[spec-alias]') {
+      if (!allowAliases) {
+        fail(`spec alias sections are not allowed in ${kind} at ${filePath}:${index + 1}`);
+      }
+      if (aliasSectionSeen) {
+        fail(`duplicate [spec-alias] section at ${filePath}:${index + 1}`);
+      }
+      if (legacyAliasesSeen) {
+        fail(`legacy spec aliases cannot be combined with [spec-alias] at ${filePath}:${index + 1}`);
+      }
+      aliasSectionSeen = true;
+
+      let aliasIndex = index + 1;
+      for (; aliasIndex < lines.length; aliasIndex++) {
+        const aliasLine = lines[aliasIndex];
+        if (isConfigComment(aliasLine)) continue;
+        if (trimConfigWhitespace(aliasLine) === '' || aliasLine.startsWith('[')) break;
+        const alias = parseConfigAssignment(aliasLine);
+        if (alias === undefined) {
+          fail(
+            `invalid spec alias at ${filePath}:${aliasIndex + 1}; `
+            + 'expected <name>=<agent-spec-prefix>',
+          );
+        }
+        addSpecAlias(alias.name, alias.value, aliasIndex + 1);
+      }
+      index = aliasIndex - 1;
+      continue;
+    }
+    if (line.startsWith('[spec-alias')) {
+      fail(`invalid spec alias header at ${filePath}:${index + 1}; expected [spec-alias]`);
+    }
 
     if (line.startsWith('[profile:')) {
       if (!allowProfiles) {
@@ -343,33 +581,36 @@ function parseConfigAssignments(
       if (rawProfiles.has(profileName)) {
         fail(`duplicate profile "${profileName}" at ${filePath}:${index + 1}`);
       }
-      rawProfiles.set(
-        profileName,
-        parseRawProfileBlock(lines, index, profileName, filePath, kind),
-      );
-      index += ROLE_NAMES.length;
+      const profile = parseRawProfileBlock(lines, index, profileName, filePath, kind);
+      rawProfiles.set(profileName, profile.assignments);
+      index = profile.lastIndex;
       continue;
     }
 
-    const separator = line.indexOf('=');
-    if (separator <= 0 || separator === line.length - 1) {
+    const configAssignment = parseConfigAssignment(line);
+    if (
+      configAssignment === undefined
+      || configAssignment.name === ''
+      || configAssignment.value === ''
+    ) {
       fail(`invalid ${kind} at ${filePath}:${index + 1}; expected <specialist-role>=<spec>`);
     }
-    const assignment = line.slice(0, separator);
+    const { name: assignment, value } = configAssignment;
     if (assignment.startsWith('spec-alias:')) {
       if (!allowAliases) {
         fail(`unknown specialist role in ${kind} at ${filePath}:${index + 1}: ${assignment}`);
       }
-      const rawName = assignment.slice('spec-alias:'.length);
-      const name = rawName.replace(/[\t ]+$/, '');
-      const target = line.slice(separator + 1).replace(/^[\t ]+|[\t ]+$/g, '');
-      try {
-        parseSpecAliasName(name);
-        if (aliases.has(name)) throw new Error(`duplicate spec alias: ${name}`);
-        aliases.set(name, parseSpecAliasTarget(target));
-      } catch (error) {
-        fail(`invalid spec alias at ${filePath}:${index + 1}: ${error.message}`);
+      if (!allowLegacyAliases) {
+        fail(
+          `legacy spec alias syntax is not allowed at ${filePath}:${index + 1}; `
+          + 'use one [spec-alias] section',
+        );
       }
+      if (aliasSectionSeen) {
+        fail(`legacy spec aliases cannot be combined with [spec-alias] at ${filePath}:${index + 1}`);
+      }
+      legacyAliasesSeen = true;
+      addSpecAlias(assignment.slice('spec-alias:'.length), value, index + 1);
       continue;
     }
 
@@ -381,7 +622,7 @@ function parseConfigAssignments(
         fail(`duplicate base profile in ${kind} at ${filePath}:${index + 1}`);
       }
       try {
-        baseProfile = parseProfileName(line.slice(separator + 1));
+        baseProfile = parseProfileName(value);
       } catch (error) {
         fail(`invalid base profile in ${kind} at ${filePath}:${index + 1}: ${error.message}`);
       }
@@ -399,7 +640,7 @@ function parseConfigAssignments(
         fail(`duplicate default profile in ${kind} at ${filePath}:${index + 1}`);
       }
       try {
-        defaultProfile = parseProfileName(line.slice(separator + 1));
+        defaultProfile = parseProfileName(value);
       } catch (error) {
         fail(`invalid default profile in ${kind} at ${filePath}:${index + 1}: ${error.message}`);
       }
@@ -413,8 +654,23 @@ function parseConfigAssignments(
       );
     }
 
+    if (assignment.startsWith('spec-label:')) {
+      if (!allowSpecLabels) {
+        fail(`unknown specialist role in ${kind} at ${filePath}:${index + 1}: ${assignment}`);
+      }
+      const name = assignment.slice('spec-label:'.length);
+      if (!ROLE_NAMES.includes(name)) {
+        fail(`unknown specialist role in ${kind} at ${filePath}:${index + 1}: ${assignment}`);
+      }
+      if (rawSpecLabels[name] !== undefined) {
+        fail(`duplicate ${name} spec label in ${kind} at ${filePath}:${index + 1}`);
+      }
+      rawSpecLabels[name] = { spec: value, line: index + 1 };
+      continue;
+    }
+
     const name = assignment;
-    const spec = line.slice(separator + 1);
+    const spec = value;
     if (!ROLE_NAMES.includes(name)) {
       fail(`unknown specialist role in ${kind} at ${filePath}:${index + 1}: ${name}`);
     }
@@ -433,31 +689,65 @@ function parseConfigAssignments(
     ...parseOptions,
     requireAll,
   });
+  const specLabels = parseStoredSpecLabels(rawSpecLabels, specs, filePath, kind);
   const profiles = new Map();
+  const profileSpecLabels = new Map();
   for (const [profileName, assignments] of rawProfiles) {
     profiles.set(profileName, parseRawRoleAssignments(assignments, filePath, {
       ...parseOptions,
       profileName,
       requireAll: true,
     }));
+    profileSpecLabels.set(profileName, rawRoleSpecLabels(assignments));
   }
-  return { aliases, baseProfile, defaultProfile, profiles, specs };
+  return {
+    aliases,
+    baseProfile,
+    defaultProfile,
+    profileSpecLabels,
+    profiles,
+    specLabels,
+    specs,
+  };
 }
 
 async function readUserRoleDefaults() {
   const home = process.env.HOME;
   if (!home) fail('HOME is not set; cannot resolve role defaults file');
-  const defaultsPath = path.join(home, '.config', 'garcon-amp.conf');
-  const info = await requireOwnedRegularFileIfPresent(defaultsPath, 'role defaults file');
+  let relativePath = userRoleDefaultsRelativePaths[0];
+  let defaultsPath = path.join(home, relativePath);
+  let info;
+  for (const candidateRelativePath of userRoleDefaultsRelativePaths) {
+    const candidatePath = path.join(home, candidateRelativePath);
+    let candidateInfo;
+    try {
+      candidateInfo = await requireOwnedRegularFileIfPresent(
+        candidatePath,
+        'role defaults file',
+      );
+    } catch (error) {
+      fail(`cannot inspect role defaults file: ${candidatePath}: ${error.message}`);
+    }
+    if (!candidateInfo) continue;
+    relativePath = candidateRelativePath;
+    defaultsPath = candidatePath;
+    info = candidateInfo;
+    break;
+  }
+  const displayPath = `$HOME/${relativePath}`;
   if (!info) {
     return {
       aliases: bundledDefaults.aliases,
       defaultProfile: undefined,
+      profileSpecLabels: new Map(),
       profiles: new Map(),
+      specLabels: {},
       specs: {},
+      displayPath,
       path: defaultsPath,
       shouldCreate: true,
-      wasUpgraded: false,
+      aliasesUpgraded: false,
+      profileUpgraded: false,
       home,
     };
   }
@@ -476,9 +766,11 @@ async function readUserRoleDefaults() {
   });
   return {
     ...config,
+    displayPath,
     path: defaultsPath,
     shouldCreate: false,
-    wasUpgraded: upgraded.wasUpgraded,
+    aliasesUpgraded: upgraded.aliasesUpgraded,
+    profileUpgraded: upgraded.profileUpgraded,
     home,
   };
 }
@@ -491,10 +783,19 @@ function configuredDefaultProfile(userDefaults) {
   return bundledDefaultProfileName;
 }
 
-function resolveProfileSpecs(profileName, userDefaults) {
-  const specs = userDefaults.profiles.get(profileName) ?? bundledProfiles.get(profileName);
+function resolveProfile(profileName, userDefaults) {
+  if (userDefaults.profiles.has(profileName)) {
+    return {
+      specs: userDefaults.profiles.get(profileName),
+      specLabels: userDefaults.profileSpecLabels.get(profileName),
+    };
+  }
+  const specs = bundledProfiles.get(profileName);
   if (specs === undefined) fail(`unknown profile: ${profileName}`);
-  return specs;
+  return {
+    specs,
+    specLabels: bundledDefaults.profileSpecLabels.get(profileName),
+  };
 }
 
 async function createBundledRoleDefaults(defaultsPath) {
@@ -542,13 +843,31 @@ function renderSpecAliases(aliases) {
     if (left > right) return 1;
     return 0;
   });
-  return `${entries.map(([name, target]) => `spec-alias:${name}=${target}`).join('\n')}\n`;
+  return `[spec-alias]\n${entries.map(([name, target]) => `${name}=${target}`).join('\n')}\n`;
 }
 
 function renderRoleConfig(roles) {
   return renderRoleAssignments(Object.fromEntries(
     roles.map((role) => [role.name, canonicalAgentSpecList(role.configs)]),
   ));
+}
+
+function renderSpecLabelAssignments(specs, specLabels) {
+  const assignments = ROLE_NAMES.flatMap((name) => {
+    const label = specLabels[name];
+    return label === specs[name] ? [] : [`spec-label:${name}=${label}`];
+  });
+  return assignments.length === 0 ? '' : `${assignments.join('\n')}\n`;
+}
+
+function renderSpecLabels(roles) {
+  const specs = Object.fromEntries(
+    roles.map((role) => [role.name, canonicalAgentSpecList(role.configs)]),
+  );
+  const specLabels = Object.fromEntries(
+    roles.map((role) => [role.name, role.specLabels.join(',')]),
+  );
+  return renderSpecLabelAssignments(specs, specLabels);
 }
 
 function renderBaseProfile(profileName) {
@@ -560,7 +879,7 @@ function renderActiveSelection(roles, profileName) {
 }
 
 function renderActiveConfig(roles, aliases, profileName) {
-  return `${renderActiveSelection(roles, profileName)}${renderSpecAliases(aliases)}`;
+  return `${renderActiveSelection(roles, profileName)}${renderSpecLabels(roles)}${renderSpecAliases(aliases)}`;
 }
 
 async function readActiveRoleConfig(filePath) {
@@ -575,6 +894,8 @@ async function readActiveRoleConfig(filePath) {
   const config = parseConfigAssignments(content, filePath, {
     allowAliases: true,
     allowBaseProfile: true,
+    allowLegacyAliases: true,
+    allowSpecLabels: true,
     requireAll: true,
     kind: 'active role config',
   });
@@ -885,7 +1206,7 @@ const {
 if (!/^\d{16}$/.test(chatId)) fail('Garcon chat ID must contain exactly 16 digits');
 const userRoleDefaults = await readUserRoleDefaults();
 const selectedDefaultProfileName = configuredDefaultProfile(userRoleDefaults);
-resolveProfileSpecs(selectedDefaultProfileName, userRoleDefaults);
+resolveProfile(selectedDefaultProfileName, userRoleDefaults);
 
 const statePath = path.join('/tmp', `garcon-amp-${chatId}`);
 const existingState = await inspectPrivateDirectory(statePath);
@@ -906,15 +1227,17 @@ const shouldApplyProfile = requestedProfile !== undefined
 const selectedProfileName = shouldApplyProfile
   ? requestedProfile ?? selectedDefaultProfileName
   : existingRoleConfig.baseProfile ?? defaultProfileName;
-const selectedProfileSpecs = shouldApplyProfile
-  ? resolveProfileSpecs(selectedProfileName, userRoleDefaults)
+const selectedProfile = shouldApplyProfile
+  ? resolveProfile(selectedProfileName, userRoleDefaults)
   : undefined;
 
 const roles = ROLE_NAMES.map((name) => {
   let configs;
+  let specLabels;
   try {
     const explicitSpecs = roleSpecs[name];
     if (explicitSpecs !== undefined) {
+      specLabels = explicitSpecs;
       configs = explicitSpecs.map((spec) => parseAgentSpecWithAliases(
         spec,
         userRoleDefaults.aliases,
@@ -925,7 +1248,9 @@ const roles = ROLE_NAMES.map((name) => {
         throw new Error(`agent spec list contains a duplicate${changed ? ' after alias resolution' : ''}`);
       }
     } else {
-      const spec = selectedProfileSpecs?.[name] ?? existingRoleConfig.specs[name];
+      const source = selectedProfile ?? existingRoleConfig;
+      const spec = source.specs[name];
+      specLabels = source.specLabels[name].split(',');
       configs = parseAgentSpecList(spec);
     }
     if (name !== 'oracle' && configs.length !== 1) {
@@ -934,7 +1259,7 @@ const roles = ROLE_NAMES.map((name) => {
   } catch (error) {
     fail(`invalid ${name} agent spec: ${error.message}`);
   }
-  return { name, ...roleDefinitions[name], configs };
+  return { name, ...roleDefinitions[name], configs, specLabels };
 });
 
 let garconCli;
@@ -1088,6 +1413,7 @@ generatedArtifacts.push({
 });
 
 const activeRoleAssignments = renderRoleConfig(roles);
+const activeSpecLabels = renderSpecLabels(roles);
 const activeSelection = renderActiveSelection(roles, selectedProfileName);
 const activeRoleConfig = renderActiveConfig(
   roles,
@@ -1095,7 +1421,11 @@ const activeRoleConfig = renderActiveConfig(
   selectedProfileName,
 );
 const roleConfigChanged = existingRoleConfig === undefined
-  || activeRoleAssignments !== renderRoleAssignments(existingRoleConfig.specs);
+  || activeRoleAssignments !== renderRoleAssignments(existingRoleConfig.specs)
+  || activeSpecLabels !== renderSpecLabelAssignments(
+    existingRoleConfig.specs,
+    existingRoleConfig.specLabels,
+  );
 const profileChanged = existingRoleConfig !== undefined
   && selectedProfileName !== (existingRoleConfig.baseProfile ?? defaultProfileName);
 const specAliasesChanged = existingRoleConfig === undefined
@@ -1113,9 +1443,13 @@ if (roleConfigChanged || profileChanged) {
 }
 let setupNoticeContent = setupNoticeConfig;
 if (userRoleDefaults.shouldCreate) {
-  setupNoticeContent += `\n${roleDefaultsCreationNotice}\n`;
-} else if (userRoleDefaults.wasUpgraded) {
-  setupNoticeContent += `\n${roleDefaultsUpgradeNotice}\n`;
+  setupNoticeContent += `\nCreated ${userRoleDefaults.displayPath} with defaults\n`;
+} else if (userRoleDefaults.aliasesUpgraded || userRoleDefaults.profileUpgraded) {
+  const upgradedSections = [
+    ...(userRoleDefaults.aliasesUpgraded ? ['[spec-alias]'] : []),
+    ...(userRoleDefaults.profileUpgraded ? ['[profile:default]'] : []),
+  ];
+  setupNoticeContent += `\nUpgraded ${userRoleDefaults.displayPath} to ${upgradedSections.join(' and ')}\n`;
 }
 
 for (const artifact of generatedArtifacts) {

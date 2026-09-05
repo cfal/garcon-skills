@@ -123,10 +123,25 @@ describe('skill activation protocol', () => {
       'legacy unprefixed role assignments remain equivalent',
       'upgraded immediately',
       'inserting `default-profile=default` and `[profile:default]`',
+      'first non-space/tab character is `#` is ignored everywhere',
+      '`#` elsewhere is data rather than an inline comment',
     ]) {
       expect(skill).toContain(requiredPhrase);
     }
     expect(skill).not.toContain('profile:<name>.<role>=');
+  });
+
+  test('prefers the Garcon config directory before the existing fallback', () => {
+    const preferredIndex = skill.indexOf('`$HOME/.garcon/garcon-amp.conf`');
+    const fallbackIndex = skill.indexOf('`$HOME/.config/garcon-amp.conf`');
+    const creationIndex = skill.indexOf(
+      'creates the preferred `$HOME/.garcon/garcon-amp.conf`',
+      fallbackIndex,
+    );
+
+    expect(preferredIndex).toBeGreaterThan(-1);
+    expect(fallbackIndex).toBeGreaterThan(preferredIndex);
+    expect(creationIndex).toBeGreaterThan(fallbackIndex);
   });
 
   test('matches installed Garcon protocol constants when available', async () => {

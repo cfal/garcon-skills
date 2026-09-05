@@ -50,13 +50,15 @@ opencode:<provider>:<model>:<variant>
 <alias>:<effort>
 ```
 
+Setup loads the first existing user configuration from `$HOME/.garcon/garcon-amp.conf`, then `$HOME/.config/garcon-amp.conf`. When neither exists, it creates the preferred `$HOME/.garcon/garcon-amp.conf`. User aliases live in one `[spec-alias]` section as `<name> = <agent-spec-prefix>` assignments. The section ends at a blank line, another section, or EOF. A line whose first non-space/tab character is `#` is ignored everywhere, including inside sections; `#` elsewhere is data rather than an inline comment. Spaces and tabs around every configuration `=` are ignored. Setup atomically upgrades legacy `spec-alias:<name>=...` rows; a file containing both forms is invalid.
+
 ALWAYS FOLLOW the complete runtime packet returned by `garcon-amp-setup`. between `GARCON-AMP INSTRUCTIONS BEGIN` and `GARCON-AMP INSTRUCTIONS END`.
 
 The runtime packet returned by setup also defines row rendering and disclosure behavior. Run `./garcon-amp-setup --help` for validation and reset details.
 
 Never reconstruct launcher paths from memory.
 
-Oracle runs its configured reviewers by default. User-directed repeated `--spec` flags append the exact supplied spec or alias tokens; `--no-defaults` omits configured reviewers. Never infer or persist runtime selections. The runtime packet also defines resolution, concurrency, attribution, and result handling.
+Oracle runs its configured reviewers by default. User-directed repeated `--spec` flags append the exact supplied spec or alias tokens; `--no-defaults` omits configured reviewers. Never infer or persist runtime selections. Request and response titles preserve configured tokens and accepted runtime tokens before alias expansion; canonical resolved specs remain the execution authority. The runtime packet also defines resolution, concurrency, attribution, and result handling.
 
 Rerun setup before an activation's first specialist use, after mid-run compaction, or whenever Garcon-Amp state is uncertain. An established installation can be rehydrated with:
 

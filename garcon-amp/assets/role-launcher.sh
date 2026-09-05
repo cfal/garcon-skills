@@ -38,19 +38,26 @@ EFFORT_OR_VARIANT=''
 WORK_PATH=$SANDBOX_PATH
 INVOCATION_PATH=''
 CONFIGURED_VALUE=''
+CONFIGURED_SPEC_LABEL=''
 PRIMARY_SPEC=''
 TITLE_SPEC_LABEL=''
 
 usage() {
   if [[ "$ROLE" == oracle ]]; then
     printf 'Usage: %s [--review] [--no-defaults] [--spec <spec-or-alias>]... [--] <prompt>\n' "$ROLE" >&2
+    printf '       %s [--review] [--no-defaults] [--spec <spec-or-alias>]... --stdin\n' "$ROLE" >&2
     printf '       %s --start [--review] [--no-defaults] [--spec <spec-or-alias>]... [--] <prompt>\n' "$ROLE" >&2
+    printf '       %s --start [--review] [--no-defaults] [--spec <spec-or-alias>]... --stdin\n' "$ROLE" >&2
   elif [[ "$ROLE" == reporter ]]; then
     printf 'Usage: %s <goal>\n' "$ROLE" >&2
+    printf '       %s --stdin\n' "$ROLE" >&2
     printf '       %s --start <goal>\n' "$ROLE" >&2
+    printf '       %s --start --stdin\n' "$ROLE" >&2
   else
     printf 'Usage: %s <prompt>\n' "$ROLE" >&2
+    printf '       %s --stdin\n' "$ROLE" >&2
     printf '       %s --start <prompt>\n' "$ROLE" >&2
+    printf '       %s --start --stdin\n' "$ROLE" >&2
   fi
   printf '       %s --status [--wait-ms <0-%s>]   (default: wait until the run settles)\n' \
     "$ROLE" "$STATUS_WAIT_LIMIT_MS" >&2
@@ -65,10 +72,14 @@ status_wait_ms=0
 status_wait_bounded=0
 status_wait_active=0
 prompt_escaped=0
+prompt_from_stdin=0
 no_defaults=0
 runtime_specs=()
+runtime_spec_labels=()
 configured_specs=()
+configured_spec_labels=()
 reviewer_specs=()
+reviewer_spec_labels=()
 declare -A spec_aliases=()
 reviewer_child_pids=()
 reviewer_count=1
@@ -88,6 +99,21 @@ require_oracle_option() {
   local option=$1
   if [[ "$ROLE" != oracle ]]; then
     printf '%s: %s is only supported by oracle\n' "$ROLE" "$option" >&2
+    exit 2
+  fi
+}
+
+read_prompt_stream() {
+  user_prompt=''
+  if IFS= read -r -d '' user_prompt; then
+    printf '%s: prompt must not contain NUL bytes\n' "$ROLE" >&2
+    exit 2
+  fi
+}
+
+require_nonblank_prompt() {
+  if [[ -z "${user_prompt//[[:space:]]/}" ]]; then
+    printf '%s: prompt must not be empty\n' "$ROLE" >&2
     exit 2
   fi
 }
@@ -118,6 +144,14 @@ if [[ "$mode" == blocking || "$mode" == start || "$mode" == detached ]]; then
         enable_review
         shift
         ;;
+      --stdin)
+        if (( prompt_from_stdin )); then
+          usage
+          exit 2
+        fi
+        prompt_from_stdin=1
+        shift
+        ;;
       --spec)
         require_oracle_option --spec
         if (( $# < 2 )) || [[ "$2" == --* ]]; then
@@ -125,6 +159,14 @@ if [[ "$mode" == blocking || "$mode" == start || "$mode" == detached ]]; then
           exit 2
         fi
         runtime_specs+=("$2")
+        shift 2
+        ;;
+      --run-spec-label)
+        if [[ "$mode" != detached ]] || (( $# < 2 )) || [[ "$2" == --* ]]; then
+          usage
+          exit 2
+        fi
+        runtime_spec_labels+=("$2")
         shift 2
         ;;
       --no-defaults)
@@ -141,23 +183,32 @@ if [[ "$mode" == blocking || "$mode" == start || "$mode" == detached ]]; then
   done
 fi
 
+if [[ "$mode" == detached ]]; then
+  if (( ${#runtime_spec_labels[@]} != ${#runtime_specs[@]} )); then usage; exit 2; fi
+else
+  runtime_spec_labels=("${runtime_specs[@]}")
+fi
+
 case "$mode" in
   blocking|start)
-    if (( ! prompt_escaped )); then
-      case "${1-}" in
-        --*) usage; exit 2 ;;
-      esac
+    if (( prompt_from_stdin )); then
+      if (( prompt_escaped || $# != 0 )); then usage; exit 2; fi
+      read_prompt_stream
+    else
+      if (( ! prompt_escaped )); then
+        case "${1-}" in
+          --*) usage; exit 2 ;;
+        esac
+      fi
+      if (( $# != 1 )); then usage; exit 2; fi
+      user_prompt=$1
     fi
-    if (( $# != 1 )); then usage; exit 2; fi
-    user_prompt=$1
-    if [[ -z "${user_prompt//[[:space:]]/}" ]]; then
-      printf '%s: prompt must not be empty\n' "$ROLE" >&2
-      exit 2
-    fi
+    require_nonblank_prompt
     ;;
   detached)
-    if (( $# != 1 )) || [[ ! -f "$1" || -L "$1" ]]; then usage; exit 2; fi
-    user_prompt="$(<"$1")"
+    if (( prompt_from_stdin || $# != 1 )) || [[ ! -f "$1" || -L "$1" ]]; then usage; exit 2; fi
+    read_prompt_stream <"$1"
+    require_nonblank_prompt
     ;;
   status)
     while (( $# )); do
@@ -197,45 +248,120 @@ require_private_directory() {
 
 require_private_directory "$STATE_PATH"
 
+trim_config_whitespace() {
+  local value=$1
+  while [[ "$value" == ' '* || "$value" == $'\t'* ]]; do
+    value=${value:1}
+  done
+  while [[ "$value" == *' ' || "$value" == *$'\t' ]]; do
+    value=${value:0:${#value}-1}
+  done
+  printf '%s' "$value"
+}
+
+parse_config_assignment() {
+  local line=$1
+  [[ "$line" == *=* ]] || return 1
+  CONFIG_ASSIGNMENT_NAME=$(trim_config_whitespace "${line%%=*}")
+  CONFIG_ASSIGNMENT_VALUE=$(trim_config_whitespace "${line#*=}")
+  [[ -n "$CONFIG_ASSIGNMENT_NAME" && -n "$CONFIG_ASSIGNMENT_VALUE" ]]
+}
+
+add_active_spec_alias() {
+  local alias_name=$1 alias_target=$2
+  if [[ ! "$alias_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf '%s: invalid active spec alias name\n' "$ROLE" >&2
+    exit 1
+  fi
+  case "$alias_name" in
+    codex|claude|pi|opencode)
+      printf '%s: reserved active spec alias name: %s\n' "$ROLE" "$alias_name" >&2
+      exit 1
+      ;;
+  esac
+  if [[ -n "${spec_aliases[$alias_name]+present}" ]]; then
+    printf '%s: duplicate active spec alias: %s\n' "$ROLE" "$alias_name" >&2
+    exit 1
+  fi
+  if ! parse_spec_alias_target "$alias_target"; then
+    printf '%s: invalid active spec alias target: %s\n' "$ROLE" "$alias_name" >&2
+    exit 1
+  fi
+  spec_aliases["$alias_name"]=$alias_target
+}
+
 load_role_config() {
-  local line spec='' matches=0 alias_assignment alias_name alias_target
+  local line trimmed_line spec='' spec_label='' matches=0 label_matches=0
+  local alias_name alias_sections=0 in_alias_section=0 legacy_aliases=0
   if [[ ! -f "$CONFIG_PATH" || -L "$CONFIG_PATH" || ! -O "$CONFIG_PATH" || ! -r "$CONFIG_PATH" ]]; then
     printf '%s: unsafe or missing active role config: %s\n' "$ROLE" "$CONFIG_PATH" >&2
     exit 1
   fi
   spec_aliases=()
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" == "$ROLE="* ]]; then
-      matches=$((matches + 1))
-      spec="${line#*=}"
-    elif [[ "$line" == spec-alias:* ]]; then
-      alias_assignment=${line#spec-alias:}
-      if [[ "$alias_assignment" != *=* ]]; then
+    line=${line%$'\r'}
+    trimmed_line=$(trim_config_whitespace "$line")
+    if [[ "$trimmed_line" == \#* ]]; then
+      continue
+    fi
+    if (( in_alias_section )); then
+      if [[ -z "$trimmed_line" ]]; then
+        in_alias_section=0
+        continue
+      fi
+      if [[ "$line" != \[* ]]; then
+        if ! parse_config_assignment "$line"; then
+          printf '%s: invalid active spec alias declaration\n' "$ROLE" >&2
+          exit 1
+        fi
+        add_active_spec_alias "$CONFIG_ASSIGNMENT_NAME" "$CONFIG_ASSIGNMENT_VALUE"
+        continue
+      fi
+      in_alias_section=0
+    fi
+
+    if [[ "$line" == '[spec-alias]' ]]; then
+      alias_sections=$((alias_sections + 1))
+      if (( alias_sections > 1 || legacy_aliases )); then
+        printf '%s: active config must contain one spec alias section\n' "$ROLE" >&2
+        exit 1
+      fi
+      in_alias_section=1
+      continue
+    elif [[ "$line" == '[spec-alias'* ]]; then
+      printf '%s: invalid active spec alias declaration\n' "$ROLE" >&2
+      exit 1
+    fi
+
+    if ! parse_config_assignment "$line"; then
+      if [[ "$trimmed_line" == "spec-label:$ROLE"* ]]; then
+        printf '%s: invalid active spec label declaration\n' "$ROLE" >&2
+        exit 1
+      elif [[ "$trimmed_line" == spec-alias* ]]; then
         printf '%s: invalid active spec alias declaration\n' "$ROLE" >&2
         exit 1
       fi
-      alias_name=${alias_assignment%%=*}
-      alias_target=${alias_assignment#*=}
-      if [[ ! "$alias_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-        printf '%s: invalid active spec alias name\n' "$ROLE" >&2
+      continue
+    fi
+
+    if [[ "$CONFIG_ASSIGNMENT_NAME" == "$ROLE" ]]; then
+      matches=$((matches + 1))
+      spec=$CONFIG_ASSIGNMENT_VALUE
+    elif [[ "$CONFIG_ASSIGNMENT_NAME" == "spec-label:$ROLE" ]]; then
+      label_matches=$((label_matches + 1))
+      spec_label=$CONFIG_ASSIGNMENT_VALUE
+    elif [[ "$CONFIG_ASSIGNMENT_NAME" == "spec-label:$ROLE"* ]]; then
+      printf '%s: invalid active spec label declaration\n' "$ROLE" >&2
+      exit 1
+    elif [[ "$CONFIG_ASSIGNMENT_NAME" == spec-alias:* ]]; then
+      if (( alias_sections )); then
+        printf '%s: active config must contain one spec alias section\n' "$ROLE" >&2
         exit 1
       fi
-      case "$alias_name" in
-        codex|claude|pi|opencode)
-          printf '%s: reserved active spec alias name: %s\n' "$ROLE" "$alias_name" >&2
-          exit 1
-          ;;
-      esac
-      if [[ -n "${spec_aliases[$alias_name]+present}" ]]; then
-        printf '%s: duplicate active spec alias: %s\n' "$ROLE" "$alias_name" >&2
-        exit 1
-      fi
-      if ! parse_spec_alias_target "$alias_target"; then
-        printf '%s: invalid active spec alias target: %s\n' "$ROLE" "$alias_name" >&2
-        exit 1
-      fi
-      spec_aliases["$alias_name"]=$alias_target
-    elif [[ "$line" == spec-alias* ]]; then
+      legacy_aliases=1
+      alias_name=${CONFIG_ASSIGNMENT_NAME#spec-alias:}
+      add_active_spec_alias "$alias_name" "$CONFIG_ASSIGNMENT_VALUE"
+    elif [[ "$CONFIG_ASSIGNMENT_NAME" == spec-alias* ]]; then
       printf '%s: invalid active spec alias declaration\n' "$ROLE" >&2
       exit 1
     fi
@@ -245,8 +371,14 @@ load_role_config() {
       "$ROLE" "$ROLE" "$CONFIG_PATH" >&2
     exit 1
   fi
+  if (( label_matches > 1 )) || { (( label_matches == 1 )) && [[ -z "$spec_label" ]]; }; then
+    printf '%s: active role config must contain at most one nonempty %s spec label: %s\n' \
+      "$ROLE" "$ROLE" "$CONFIG_PATH" >&2
+    exit 1
+  fi
 
   CONFIGURED_VALUE=$spec
+  CONFIGURED_SPEC_LABEL=${spec_label:-$spec}
 }
 
 parse_agent_spec() {
@@ -322,6 +454,23 @@ resolve_agent_spec_alias() {
   fi
 }
 
+validate_stored_spec_label() {
+  local label=$1 resolved_spec=$2 name level
+  if parse_agent_spec "$label"; then
+    [[ "$label" == "$resolved_spec" ]]
+    return
+  fi
+  name=${label%%:*}
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then return 1; fi
+  case "$name" in codex|claude|pi|opencode) return 1 ;; esac
+  if [[ "$label" == *:* ]]; then
+    level=${label#*:}
+    if [[ -z "$level" || "$level" == *:* || "$level" == *,* || "$level" == *$'\r'* ]]; then
+      return 1
+    fi
+  fi
+}
+
 if [[ "$mode" != status && "$mode" != kill ]]; then
   load_role_config
   if [[ "$ROLE" == oracle ]]; then
@@ -333,8 +482,22 @@ if [[ "$mode" != status && "$mode" != kill ]]; then
   else
     configured_specs=("$CONFIGURED_VALUE")
   fi
+  if [[ "$ROLE" == oracle ]]; then
+    if [[ "$CONFIGURED_SPEC_LABEL" == ,* || "$CONFIGURED_SPEC_LABEL" == *, || "$CONFIGURED_SPEC_LABEL" == *,,* ]]; then
+      printf '%s: invalid active Oracle spec label list\n' "$ROLE" >&2
+      exit 1
+    fi
+    IFS=, read -r -a configured_spec_labels <<<"$CONFIGURED_SPEC_LABEL"
+  else
+    configured_spec_labels=("$CONFIGURED_SPEC_LABEL")
+  fi
+  if (( ${#configured_spec_labels[@]} != ${#configured_specs[@]} )); then
+    printf '%s: active spec label count does not match configured reviewers\n' "$ROLE" >&2
+    exit 1
+  fi
 
   validated_configured_specs=()
+  validated_configured_spec_labels=()
   for index in "${!configured_specs[@]}"; do
     spec=${configured_specs[index]}
     if ! parse_agent_spec "$spec"; then
@@ -346,6 +509,22 @@ if [[ "$mode" != status && "$mode" != kill ]]; then
       fi
       exit 1
     fi
+    if ! validate_stored_spec_label "${configured_spec_labels[index]}" "$spec"; then
+      if [[ "$ROLE" == oracle ]]; then
+        printf '%s: invalid active spec label for configured reviewer %s\n' \
+          "$ROLE" "$((index + 1))" >&2
+      else
+        printf '%s: invalid active spec label\n' "$ROLE" >&2
+      fi
+      exit 1
+    fi
+    for selected_label in "${validated_configured_spec_labels[@]}"; do
+      if [[ "${configured_spec_labels[index]}" == "$selected_label" ]]; then
+        printf '%s: duplicate active spec label for configured reviewer %s\n' \
+          "$ROLE" "$((index + 1))" >&2
+        exit 1
+      fi
+    done
     for selected_spec in "${validated_configured_specs[@]}"; do
       if [[ "$spec" == "$selected_spec" ]]; then
         printf '%s: duplicate active agent spec for configured reviewer %s\n' \
@@ -354,16 +533,21 @@ if [[ "$mode" != status && "$mode" != kill ]]; then
       fi
     done
     validated_configured_specs+=("$spec")
+    validated_configured_spec_labels+=("${configured_spec_labels[index]}")
   done
 
   if (( no_defaults )); then
     reviewer_specs=()
+    reviewer_spec_labels=()
   else
     reviewer_specs=("${configured_specs[@]}")
+    reviewer_spec_labels=("${configured_spec_labels[@]}")
   fi
 
   validated_runtime_specs=()
-  for raw_spec in "${runtime_specs[@]}"; do
+  for index in "${!runtime_specs[@]}"; do
+    raw_spec=${runtime_specs[index]}
+    spec_label=${runtime_spec_labels[index]}
     resolve_agent_spec_alias "$raw_spec"
     spec=$RESOLVED_SPEC
     if ! parse_agent_spec "$spec"; then
@@ -374,6 +558,14 @@ if [[ "$mode" != status && "$mode" != kill ]]; then
         printf '%s: invalid --spec agent spec: %s\n' "$ROLE" "$spec" >&2
       fi
       exit 2
+    fi
+    if [[ "$mode" == detached ]]; then
+      resolve_agent_spec_alias "$spec_label"
+      if [[ "$RESOLVED_SPEC" != "$spec" ]]; then
+        printf '%s: invalid detached spec label for reviewer %s\n' \
+          "$ROLE" "$((index + 1))" >&2
+        exit 2
+      fi
     fi
     for selected_spec in "${validated_runtime_specs[@]}"; do
       if [[ "$spec" == "$selected_spec" ]]; then
@@ -397,6 +589,7 @@ if [[ "$mode" != status && "$mode" != kill ]]; then
       (( configured_match )) && continue
     fi
     reviewer_specs+=("$spec")
+    reviewer_spec_labels+=("$spec_label")
   done
   runtime_specs=("${validated_runtime_specs[@]}")
 
@@ -407,11 +600,11 @@ if [[ "$mode" != status && "$mode" != kill ]]; then
 
   reviewer_count=${#reviewer_specs[@]}
   PRIMARY_SPEC=${reviewer_specs[0]}
-  TITLE_SPEC_LABEL=$PRIMARY_SPEC
+  TITLE_SPEC_LABEL=${reviewer_spec_labels[0]}
   if (( reviewer_count > 1 )); then
     group_title_detail="$reviewer_count reviewers"
-    for spec in "${reviewer_specs[@]:1}"; do
-      TITLE_SPEC_LABEL+=", $spec"
+    for spec_label in "${reviewer_spec_labels[@]:1}"; do
+      TITLE_SPEC_LABEL+=", $spec_label"
     done
   fi
 
@@ -979,8 +1172,11 @@ do_start() {
 
   if (( review_mode )); then detached_command+=(--review); fi
   if (( no_defaults )); then detached_command+=(--no-defaults); fi
-  for spec in "${runtime_specs[@]}"; do
-    detached_command+=(--spec "$spec")
+  for index in "${!runtime_specs[@]}"; do
+    detached_command+=(
+      --spec "${runtime_specs[index]}"
+      --run-spec-label "${runtime_spec_labels[index]}"
+    )
   done
   detached_command+=("$PROMPT_FILE")
   "${detached_command[@]}" </dev/null >>"$RUN_LOG" 2>&1 &
