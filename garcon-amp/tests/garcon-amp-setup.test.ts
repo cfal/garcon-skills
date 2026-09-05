@@ -395,6 +395,8 @@ await appendFile(process.env.GARCON_AMP_TEST_LOG, JSON.stringify({
   systemPrompt,
   cwd: process.cwd(),
   env: {
+    anthropicBaseUrl: process.env.ANTHROPIC_BASE_URL ?? null,
+    anthropicTest: process.env.ANTHROPIC_TEST_SECRET ?? null,
     claudeCode: process.env.CLAUDECODE ?? null,
     claudeTest: process.env.CLAUDE_TEST_SECRET ?? null,
     unrelated: process.env.GARCON_AMP_UNRELATED ?? null,
@@ -6578,11 +6580,13 @@ describe('generated adapters', () => {
     await assertNoTemporaryFiles(malformed.statePath);
   });
 
-  test('starts Claude fresh with dontAsk, global access, and clean Claude environment', async () => {
+  test('starts Claude fresh with dontAsk, global access, and a clean provider environment', async () => {
     const { chatId, statePath } = newChatId();
     expect((await setup(chatId, ['--oracle', 'claude:opus:max'])).exitCode).toBe(0);
     const launcher = path.join(statePath, 'oracle');
     const env = {
+      ANTHROPIC_BASE_URL: 'https://main-agent.example.test',
+      ANTHROPIC_TEST_SECRET: 'remove-me-too',
       CLAUDECODE: 'nested',
       CLAUDE_TEST_SECRET: 'remove-me',
       GARCON_AMP_UNRELATED: 'keep-me',
@@ -6607,6 +6611,8 @@ describe('generated adapters', () => {
       expect(call.args).not.toContain('plan');
       expect(call.args.join(',')).not.toContain('Agent');
       expect(call.env).toEqual({
+        anthropicBaseUrl: null,
+        anthropicTest: null,
         claudeCode: null,
         claudeTest: null,
         unrelated: 'keep-me',

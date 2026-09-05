@@ -1502,7 +1502,7 @@ run_claude() {
   fi
   while IFS='=' read -r variable _; do
     case "$variable" in
-      CLAUDECODE|CLAUDE_*) clean_env+=(-u "$variable") ;;
+      ANTHROPIC_*|CLAUDECODE|CLAUDE_*) clean_env+=(-u "$variable") ;;
     esac
   done < <(env)
 
