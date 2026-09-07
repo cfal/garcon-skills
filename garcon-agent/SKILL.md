@@ -93,6 +93,7 @@ Use only flags with actual values:
 ```bash
 "${GARCON_CLI[@]}" \
   --workspace "$WORKSPACE" \
+  start \
   --cwd "$TARGET_DIR" \
   --agent "$AGENT" \
   --provider "$PROVIDER" \
@@ -110,7 +111,7 @@ Common request mapping:
 - “Get Claude opus at max effort to review…, add the review tag” means discover the unique Claude agent and opus model, validate `max`, use `plan`, add `--tag review`, and omit `--title`.
 - For multiple consultants, create one chat per agent and keep each chat ID paired with its selection.
 
-Do not impose an artificial timeout. Keep the CLI attached while the agent works or waits for Garcon interaction.
+Do not impose an artificial timeout. Keep synchronous `start` and `resume` commands attached while the agent works or waits for Garcon interaction.
 
 ## Resume Chat
 
@@ -119,11 +120,24 @@ Resume follow-up work on the same topic and agent instead of starting over:
 ```bash
 "${GARCON_CLI[@]}" \
   --workspace "$WORKSPACE" \
-  --resume "$CHAT_ID" \
+  resume "$CHAT_ID" \
   - < "$FOLLOW_UP_PROMPT_FILE"
 ```
 
 Use the chat ID recorded from the earlier turn; ask when it is unavailable. Never resume one agent's chat as another agent. Do not pass `--cwd` on resume because the chat retains it, but restate its exact recorded `TARGET_DIR` confinement in the follow-up prompt. Add title, tags, effort, permissions, model, provider, or endpoint only when explicitly requested or required for the new turn. A follow-up that changes from review to fixes must override permissions to a discovered write-capable mode.
+
+## Resume Chat Asynchronously
+
+Use `resume-async` only when the user explicitly requests an immediate return after acceptance or asks to steer a busy turn. It inherits the chat's saved execution settings and does not wait for agent completion:
+
+```bash
+"${GARCON_CLI[@]}" \
+  --workspace "$WORKSPACE" \
+  resume-async "$CHAT_ID" \
+  - < "$FOLLOW_UP_PROMPT_FILE"
+```
+
+Add `--allow-steer` only when the user explicitly asks to steer the active turn. Without it, a busy chat fails without queueing; with it, Garcon may deliver into the active turn and still never queues. Record the returned chat and turn IDs before continuing.
 
 ## Return The Result
 
@@ -131,7 +145,10 @@ Expect stdout to print:
 
 ```text
 chat id: <chat-id>
+turn id: <turn-id>
 <agent response>
 ```
 
 Record the chat ID immediately and return it with the agent and model. `SIGINT` detaches the CLI but does not stop the Garcon turn; use Garcon controls to stop work. After an accepted chat ID, inspect that chat before retrying a transport failure so the same task is not submitted twice.
+
+For `resume-async`, expect `delivery: new-turn|steer` between the chat and turn IDs. Acceptance does not mean the agent completed successfully; use the returned handle to inspect or wait for the exact turn.

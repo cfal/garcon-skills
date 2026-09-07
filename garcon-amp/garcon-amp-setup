@@ -80,7 +80,8 @@ Options:
   --shared-sandbox <dir>  Absolute sandbox shared by the parent and specialists
                            (created recursively when missing)
                            (existing selection is tightened to 0700)
-                           (first-run default: /tmp/garcon-amp-<chat-id>/sandbox)
+                           (fresh default: configured sandbox-path, otherwise
+                            /tmp/garcon-amp-<chat-id>/sandbox)
   --profile <name>        Select that exact complete role profile for this chat
   --reset-defaults        Reset roles to the configured default profile and sandbox
                            before explicit overrides
@@ -119,6 +120,12 @@ no blank or unrelated non-comment lines inside the block:
   librarian=<spec-or-alias>
   reporter=<spec-or-alias>
 
+Outside profile and alias sections, sandbox-path=<path> sets the sandbox used by
+fresh setup and --reset-defaults. Absolute paths, ~, ~/..., $HOME, and $HOME/...
+are supported; no other variable or tilde expansion is performed. A newly selected
+directory is created recursively and tightened to 0700. Existing chat selections
+remain preserved until reset, and --shared-sandbox overrides the configured default.
+
 Parsing resumes normally after reporter. default-profile=<name> selects the profile
 used by fresh setup and --reset-defaults. For backward compatibility, unprefixed
 role assignments are equivalent to [profile:default]. They are immediately upgraded
@@ -141,8 +148,8 @@ reset to the configured default.
 
 Every successful rerun validates the installation, publishes a re-initialized
 notice in the selected chat, and reprints its complete runtime instruction packet.
-The notice shows the complete current role config when it changed, Spec aliases
-changed for an alias-only update, and No changes otherwise.`;
+A changed setup lists the four current specialists and resolved sandbox path as
+Markdown. An unchanged setup reports only No changes.`;
 
 const instructionsFileName = 'INSTRUCTIONS.md';
 const instructionsBeginMarker = 'GARCON-AMP INSTRUCTIONS BEGIN';
@@ -157,15 +164,29 @@ const userRoleDefaultsRelativePaths = [
 const initializationNoticeTitle = 'Garcon-Amp initialized';
 const reinitializationNoticeTitle = 'Garcon-Amp re-initialized';
 const noRoleChangesNotice = 'No changes';
-const specAliasesChangedNotice = 'Spec aliases changed';
 
 function fail(message) {
   console.error(`garcon-amp-setup: ${message}`);
   process.exit(2);
 }
 
+if (process.env.GARCON_AMP_SPECIALIST_DEPTH) {
+  fail('nested Garcon-Amp setup is disabled inside a specialist invocation');
+}
+
 function shellQuote(value) {
   return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function markdownCodeSpan(value) {
+  const backtickRuns = value.match(/`+/g) ?? [];
+  const fenceLength = backtickRuns.reduce(
+    (length, run) => Math.max(length, run.length + 1),
+    1,
+  );
+  const fence = '`'.repeat(fenceLength);
+  const padding = value.startsWith('`') || value.endsWith('`') ? ' ' : '';
+  return `${fence}${padding}${value}${padding}${fence}`;
 }
 
 function parseProfileName(name) {
@@ -500,6 +521,7 @@ function parseConfigAssignments(
     allowDefaultProfile = false,
     allowLegacyAliases = false,
     allowProfiles = false,
+    allowSandboxPath = false,
     allowSpecLabels = false,
     requireAll = false,
     resolveAliases = false,
@@ -515,6 +537,7 @@ function parseConfigAssignments(
   let baseProfile;
   let defaultProfile;
   let legacyAliasesSeen = false;
+  let sandboxPath;
   const lines = content.split('\n').map(normalizeConfigLine);
 
   const addSpecAlias = (name, target, lineNumber) => {
@@ -588,14 +611,26 @@ function parseConfigAssignments(
     }
 
     const configAssignment = parseConfigAssignment(line);
-    if (
-      configAssignment === undefined
-      || configAssignment.name === ''
-      || configAssignment.value === ''
-    ) {
+    if (configAssignment === undefined || configAssignment.name === '') {
       fail(`invalid ${kind} at ${filePath}:${index + 1}; expected <specialist-role>=<spec>`);
     }
     const { name: assignment, value } = configAssignment;
+    if (assignment === 'sandbox-path') {
+      if (!allowSandboxPath) {
+        fail(`unknown specialist role in ${kind} at ${filePath}:${index + 1}: ${assignment}`);
+      }
+      if (value === '') {
+        fail(`invalid sandbox-path at ${filePath}:${index + 1}; expected a non-empty path`);
+      }
+      if (sandboxPath !== undefined) {
+        fail(`duplicate sandbox-path in ${kind} at ${filePath}:${index + 1}`);
+      }
+      sandboxPath = { value, line: index + 1 };
+      continue;
+    }
+    if (value === '') {
+      fail(`invalid ${kind} at ${filePath}:${index + 1}; expected <specialist-role>=<spec>`);
+    }
     if (assignment.startsWith('spec-alias:')) {
       if (!allowAliases) {
         fail(`unknown specialist role in ${kind} at ${filePath}:${index + 1}: ${assignment}`);
@@ -706,16 +741,55 @@ function parseConfigAssignments(
     defaultProfile,
     profileSpecLabels,
     profiles,
+    sandboxPath,
     specLabels,
     specs,
   };
 }
 
+function expandConfiguredSandboxPath(assignment, home, filePath) {
+  const { value, line } = assignment;
+  let expanded = value;
+  if (value === '~') {
+    expanded = home;
+  } else if (value.startsWith('~/')) {
+    expanded = path.join(home, value.slice(2));
+  } else if (value === '$HOME') {
+    expanded = home;
+  } else if (value.startsWith('$HOME/')) {
+    expanded = path.join(home, value.slice(6));
+  }
+  if (!path.isAbsolute(expanded)) {
+    fail(
+      `invalid sandbox-path at ${filePath}:${line}; `
+      + 'expected an absolute path, ~, ~/..., $HOME, or $HOME/...',
+    );
+  }
+  expanded = path.normalize(expanded);
+  assertInstructionValue('configured sandbox path', expanded);
+  return expanded;
+}
+
+async function resolvePotentialPath(filePath) {
+  let existingPrefix = filePath;
+  const missingSegments = [];
+  while (true) {
+    try {
+      return path.join(await realpath(existingPrefix), ...missingSegments);
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR'].includes(error?.code)) return filePath;
+      const parent = path.dirname(existingPrefix);
+      if (parent === existingPrefix) return filePath;
+      missingSegments.unshift(path.basename(existingPrefix));
+      existingPrefix = parent;
+    }
+  }
+}
+
 async function readUserRoleDefaults() {
   const home = process.env.HOME;
   if (!home) fail('HOME is not set; cannot resolve role defaults file');
-  let relativePath = userRoleDefaultsRelativePaths[0];
-  let defaultsPath = path.join(home, relativePath);
+  let defaultsPath = path.join(home, userRoleDefaultsRelativePaths[0]);
   let info;
   for (const candidateRelativePath of userRoleDefaultsRelativePaths) {
     const candidatePath = path.join(home, candidateRelativePath);
@@ -729,21 +803,19 @@ async function readUserRoleDefaults() {
       fail(`cannot inspect role defaults file: ${candidatePath}: ${error.message}`);
     }
     if (!candidateInfo) continue;
-    relativePath = candidateRelativePath;
     defaultsPath = candidatePath;
     info = candidateInfo;
     break;
   }
-  const displayPath = `$HOME/${relativePath}`;
   if (!info) {
     return {
       aliases: bundledDefaults.aliases,
       defaultProfile: undefined,
       profileSpecLabels: new Map(),
       profiles: new Map(),
+      sandboxPath: undefined,
       specLabels: {},
       specs: {},
-      displayPath,
       path: defaultsPath,
       shouldCreate: true,
       aliasesUpgraded: false,
@@ -762,11 +834,15 @@ async function readUserRoleDefaults() {
     allowAliases: true,
     allowDefaultProfile: true,
     allowProfiles: true,
+    allowSandboxPath: true,
     resolveAliases: true,
   });
+  const sandboxPath = config.sandboxPath === undefined
+    ? undefined
+    : expandConfiguredSandboxPath(config.sandboxPath, home, defaultsPath);
   return {
     ...config,
-    displayPath,
+    sandboxPath,
     path: defaultsPath,
     shouldCreate: false,
     aliasesUpgraded: upgraded.aliasesUpgraded,
@@ -1028,11 +1104,13 @@ function garconCliCommand(garconCli, ...args) {
   return [...command, ...args];
 }
 
-async function publishSetupNotice(garconCli, chatId, title, content) {
+async function publishSetupNotice(garconCli, chatId, title, content, markdown) {
   const child = Bun.spawn({
     cmd: garconCliCommand(
       garconCli, 'add-row', chatId,
-      '--type', 'notice', '--title', title, '-',
+      '--type', 'notice', '--title', title,
+      ...(markdown ? ['--markdown'] : []),
+      '-',
     ),
     cwd: garconCli.garconPath,
     env: process.env,
@@ -1170,12 +1248,15 @@ async function resolveSharedSandbox(directory, recovery) {
 function openCodeConfig(agentName, role) {
   const editAndBashPermission = role === 'finder' ? 'deny' : 'allow';
   return JSON.stringify({
+    autoupdate: false,
     share: 'disabled',
     subagent_depth: 0,
+    skills: { paths: [], urls: [] },
     agent: {
       [agentName]: {
         description: `Garcon-Amp ${role} specialist`,
         mode: 'primary',
+        tools: { skill: false },
         permission: {
           '*': 'deny',
           read: 'allow',
@@ -1185,7 +1266,11 @@ function openCodeConfig(agentName, role) {
           grep: 'allow',
           list: 'allow',
           external_directory: 'allow',
+          'mcp_*': 'deny',
+          skill: 'deny',
           task: 'deny',
+          code_mode: 'deny',
+          parallel: 'deny',
           question: 'deny',
           plan_enter: 'deny',
           plan_exit: 'deny',
@@ -1291,7 +1376,8 @@ if (selectedGarconCliExecutable !== undefined) {
 }
 const { garconPath, garconCliPath, garconCliRunner } = garconCli;
 
-const defaultSandboxPath = path.join(statePath, 'sandbox');
+const stateSandboxPath = path.join(statePath, 'sandbox');
+const defaultSandboxPath = userRoleDefaults.sandboxPath ?? stateSandboxPath;
 const storedSandboxPath = requestedSharedSandbox === undefined && !resetDefaults
   ? existingInstallation?.sandboxPath
   : undefined;
@@ -1301,8 +1387,14 @@ const selectedSandboxPath = requestedSharedSandbox
 if (requestedSharedSandbox !== undefined && !path.isAbsolute(requestedSharedSandbox)) {
   fail(`shared sandbox must be an absolute directory path: ${requestedSharedSandbox}`);
 }
+const configuredSandboxPath = userRoleDefaults.sandboxPath === undefined
+  ? undefined
+  : await resolvePotentialPath(userRoleDefaults.sandboxPath);
+const shouldCreateSelectedSandbox = requestedSharedSandbox !== undefined
+  || (userRoleDefaults.sandboxPath !== undefined
+    && (storedSandboxPath === undefined || storedSandboxPath === configuredSandboxPath));
 let sandboxPath = selectedSandboxPath;
-if (requestedSharedSandbox === undefined && selectedSandboxPath !== defaultSandboxPath) {
+if (!shouldCreateSelectedSandbox && selectedSandboxPath !== stateSandboxPath) {
   sandboxPath = await resolveSharedSandbox(
     selectedSandboxPath,
     'recreate it, pass --shared-sandbox <absolute-directory> to create or select one, or use --reset-defaults',
@@ -1330,7 +1422,7 @@ const instructionsTemplate = await readBundledFile(
   'runtime instruction template',
 );
 
-if (requestedSharedSandbox !== undefined) {
+if (shouldCreateSelectedSandbox) {
   assertInstructionValue('shared sandbox path', selectedSandboxPath);
   try {
     await mkdir(selectedSandboxPath, { recursive: true, mode: 0o700 });
@@ -1339,10 +1431,11 @@ if (requestedSharedSandbox !== undefined) {
   }
   sandboxPath = await resolveSharedSandbox(
     selectedSandboxPath,
-    'the explicit path could not be resolved after its creation check; check path access and retry',
+    'the selected path could not be resolved after its creation check; check path access and retry',
   );
 }
 
+assertInstructionValue('resolved sandbox path', sandboxPath);
 await ensurePrivateDirectory(statePath);
 await ensurePrivateDirectory(sandboxPath);
 
@@ -1381,10 +1474,7 @@ const generatedRoles = roles.map((role) => {
 const instructionsPath = path.join(statePath, instructionsFileName);
 const instructionPacket = renderInstructions(instructionsTemplate, {
   CHAT_ID: chatId,
-  STATE_PATH: statePath,
   INSTRUCTIONS_PATH: instructionsPath,
-  GARCON_PATH: garconPath,
-  SANDBOX_PATH: sandboxPath,
   ORACLE_PATH: path.join(statePath, 'oracle'),
   FINDER_PATH: path.join(statePath, 'finder'),
   LIBRARIAN_PATH: path.join(statePath, 'librarian'),
@@ -1414,7 +1504,6 @@ generatedArtifacts.push({
 
 const activeRoleAssignments = renderRoleConfig(roles);
 const activeSpecLabels = renderSpecLabels(roles);
-const activeSelection = renderActiveSelection(roles, selectedProfileName);
 const activeRoleConfig = renderActiveConfig(
   roles,
   userRoleDefaults.aliases,
@@ -1433,24 +1522,21 @@ const specAliasesChanged = existingRoleConfig === undefined
 const setupNoticeTitle = existingRoleConfig === undefined
   ? initializationNoticeTitle
   : reinitializationNoticeTitle;
-let setupNoticeConfig;
-if (roleConfigChanged || profileChanged) {
-  setupNoticeConfig = activeSelection;
-} else if (specAliasesChanged) {
-  setupNoticeConfig = `${specAliasesChangedNotice}\n`;
-} else {
-  setupNoticeConfig = `${noRoleChangesNotice}\n`;
-}
-let setupNoticeContent = setupNoticeConfig;
-if (userRoleDefaults.shouldCreate) {
-  setupNoticeContent += `\nCreated ${userRoleDefaults.displayPath} with defaults\n`;
-} else if (userRoleDefaults.aliasesUpgraded || userRoleDefaults.profileUpgraded) {
-  const upgradedSections = [
-    ...(userRoleDefaults.aliasesUpgraded ? ['[spec-alias]'] : []),
-    ...(userRoleDefaults.profileUpgraded ? ['[profile:default]'] : []),
-  ];
-  setupNoticeContent += `\nUpgraded ${userRoleDefaults.displayPath} to ${upgradedSections.join(' and ')}\n`;
-}
+const sandboxChanged = existingInstallation?.sandboxPath !== sandboxPath;
+const setupChanged = roleConfigChanged
+  || profileChanged
+  || specAliasesChanged
+  || sandboxChanged
+  || userRoleDefaults.shouldCreate
+  || userRoleDefaults.aliasesUpgraded
+  || userRoleDefaults.profileUpgraded;
+const roleNoticeContent = roles.map((role) => {
+  const spec = role.configs.map(canonicalAgentSpec).join(',');
+  return `${role.name}: ${markdownCodeSpan(spec)}`;
+}).join('  \n');
+const setupNoticeContent = setupChanged
+  ? `${roleNoticeContent}\n\nsandbox: ${markdownCodeSpan(sandboxPath)}\n`
+  : `${noRoleChangesNotice}\n`;
 
 for (const artifact of generatedArtifacts) {
   await atomicWriteIfChanged(
@@ -1470,6 +1556,7 @@ const noticeStatus = await publishSetupNotice(
   chatId,
   setupNoticeTitle,
   setupNoticeContent,
+  setupChanged,
 );
 if (noticeStatus !== 0) {
   if (createdRoleDefaultsIdentity) {

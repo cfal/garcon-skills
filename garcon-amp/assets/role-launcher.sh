@@ -2,6 +2,10 @@
 set -euo pipefail
 
 ROLE=__ROLE__
+if [[ -n "${GARCON_AMP_SPECIALIST_DEPTH:-}" ]]; then
+  printf '%s: nested Garcon-Amp specialist invocation is disabled\n' "$ROLE" >&2
+  exit 2
+fi
 CHAT_ID=__CHAT_ID__
 GARCON_PATH=__GARCON_PATH__
 GARCON_CLI_PATH=__GARCON_CLI_PATH__
@@ -856,7 +860,7 @@ run_record_is_alive() {
 
 claim_run() {
   local claim_mode=$1 claim_pid=$2 claim_status=$3 claim_callback=$4
-  local temporary run_id existing_pid existing_starter_pid display_pid starter_pid=''
+  local temporary run_id existing_pid existing_starter_pid starter_pid=''
   [[ "$claim_status" == starting ]] && starter_pid=$$
   run_id="$(bun -e 'console.log(crypto.randomUUID().slice(0, 6))')"
   temporary="$(mktemp "$STATE_PATH/.$ROLE.run.XXXXXX")"
@@ -871,7 +875,7 @@ claim_run() {
     'finishedAt=' \
     'exitCode=' \
     "responsePath=$RESPONSE_FILE" \
-    'responseBytes=0' \
+    'responseBytes=' \
     "logPath=$RUN_LOG" \
     "callback=$claim_callback" \
     "review=$review_mode" \
@@ -887,11 +891,9 @@ claim_run() {
   existing_pid="${run_state[pid]:-}"
   existing_starter_pid="${run_state[starterPid]:-}"
   if run_record_is_alive "${run_state[status]:-}" "$existing_pid" "$existing_starter_pid"; then
-    display_pid=$existing_pid
-    run_is_alive "$display_pid" || display_pid=$existing_starter_pid
     rm -f -- "$temporary"
-    printf '%s: a consultation is already running (pid %s); use "%s --status --wait-ms 0" or "%s --kill"\n' \
-      "$ROLE" "$display_pid" "$LAUNCHER_PATH" "$LAUNCHER_PATH" >&2
+    printf '%s: a consultation is already running; use "%s --status --wait-ms 0" or "%s --kill"\n' \
+      "$ROLE" "$LAUNCHER_PATH" "$LAUNCHER_PATH" >&2
     exit 3
   fi
   rm -f -- "$RUN_FILE"
@@ -902,6 +904,13 @@ claim_run() {
   rm -f -- "$temporary"
   printf '%s: could not claim the run lock: %s\n' "$ROLE" "$RUN_FILE" >&2
   exit 3
+}
+
+reset_response_file() {
+  rm -f -- "$RESPONSE_FILE"
+  : >"$RESPONSE_FILE"
+  chmod 600 "$RESPONSE_FILE"
+  update_run_state 'responseBytes=0'
 }
 
 format_elapsed() {
@@ -986,7 +995,7 @@ send_callback() {
   fi
   callback_title="$(title_with_spec "$callback_title")"
   callback_command=(
-    "${GARCON_CLI_ARGV[@]}" send-async "$CHAT_ID"
+    "${GARCON_CLI_ARGV[@]}" resume-async "$CHAT_ID"
     --allow-steer
     --message-title "$callback_title"
     "${callback_presentation[@]}"
@@ -1042,35 +1051,36 @@ finalize_run() {
 
 print_run_status() {
   local reported="${run_state[status]:-none}" pid="${run_state[pid]:-0}"
-  local starter_pid="${run_state[starterPid]:-0}" reference
+  local starter_pid="${run_state[starterPid]:-0}" response_path
   if [[ -z "${run_state[runId]:-}" ]]; then
-    printf 'role: %s\nstatus: none\n' "$ROLE"
+    printf 'status: none\n'
     return 0
   fi
   if [[ "$reported" == running || "$reported" == starting ]] && \
     ! run_record_is_alive "$reported" "$pid" "$starter_pid"; then
     reported=died
   fi
-  reference="${run_state[finishedAt]:-}"
-  [[ -n "$reference" ]] || reference=$EPOCHSECONDS
-  printf 'role: %s\n' "$ROLE"
-  printf 'run: %s\n' "${run_state[runId]}"
   printf 'status: %s\n' "$reported"
-  printf 'mode: %s\n' "${run_state[mode]:-unknown}"
-  printf 'pid: %s\n' "$pid"
-  if [[ "${run_state[review]:-0}" == 1 ]]; then
-    printf 'review: yes\n'
-  else
-    printf 'review: no\n'
+  if [[ "$reported" == running || "$reported" == starting ]]; then
+    if [[ "${run_state[callback]:-}" == pending ]]; then
+      printf 'wait: callback\n'
+    else
+      printf 'wait: blocking\n'
+    fi
   fi
-  printf 'reviewers: %s\n' "${run_state[reviewers]:-1}"
-  printf 'elapsed: %s\n' "$(format_elapsed "$(( reference - ${run_state[startedAt]:-$reference} ))")"
-  if [[ -n "${run_state[exitCode]:-}" ]]; then
-    printf 'exit: %s\n' "${run_state[exitCode]}"
-  fi
-  printf 'callback: %s\n' "${run_state[callback]:-skipped}"
-  printf 'response: %s (%s bytes)\n' "${run_state[responsePath]:-$RESPONSE_FILE}" "${run_state[responseBytes]:-0}"
-  printf 'log: %s\n' "${run_state[logPath]:-$RUN_LOG}"
+  response_path="${run_state[responsePath]:-$RESPONSE_FILE}"
+  case "$reported" in
+    finished|partial|failed|killed|died)
+      if [[ -n "${run_state[responseBytes]:-}" && -s "$response_path" ]]; then
+        printf 'response: %s\n' "$response_path"
+      fi
+      ;;
+  esac
+  case "$reported" in
+    partial|failed|killed|died)
+      printf 'log: %s\n' "${run_state[logPath]:-$RUN_LOG}"
+      ;;
+  esac
 }
 
 run_wait_is_settled() {
@@ -1164,6 +1174,7 @@ do_start() {
   local waited=0 pid=''
   local -a detached_command=(setsid "$LAUNCHER_PATH" --run-detached)
   claim_run start 0 starting pending
+  reset_response_file
   printf '%s' "$user_prompt" >"$PROMPT_FILE"
   chmod 600 "$PROMPT_FILE"
   rm -f -- "$RUN_LOG"
@@ -1195,7 +1206,7 @@ do_start() {
     printf '%s: detached consultation did not start; see %s\n' "$ROLE" "$RUN_LOG" >&2
     exit 1
   fi
-  print_run_status
+  printf '%s started; result will arrive asynchronously.\n' "$ROLE_ACTIVITY_TITLE"
 }
 
 adopt_run() {
@@ -1224,13 +1235,10 @@ case "$mode" in
   blocking)
     create_invocation_path
     claim_run blocking "$$" running skipped
+    reset_response_file
     run_owned=1
     ;;
 esac
-
-rm -f -- "$RESPONSE_FILE"
-: >"$RESPONSE_FILE"
-chmod 600 "$RESPONSE_FILE"
 if [[ "$ROLE" == reporter ]]; then
   create_reporter_work_path
   update_run_state "workPath=$reporter_work_path"
@@ -1331,7 +1339,7 @@ Private artifact directory (removed when this run ends): %s
 Garcon CLI command: %s
 Transcript query path: %s
 
-Treat this request as self-contained. The parent/orchestrator owns the user task, decisions, implementation, final verification, and user communication. Use only sources and source locators supplied in the goal. Put transient files only in the private artifact directory and leave them there for launcher cleanup. Do not modify any source transcript, repository, Git state, or Garcon chat. Do not delegate or ask questions. Return one complete result.
+The parent/orchestrator owns the user task, decisions, implementation, final verification, and user communication. Put transient files only in the private artifact directory and leave them there for launcher cleanup. No follow-up is available. Return one complete result.
 
 Goal:
 %s' \
@@ -1344,7 +1352,7 @@ Shared sandbox directory: %s
 
 Treat this request as self-contained. The parent/orchestrator owns the user task, all intended changes to the target repository, integration, final verification, and user communication.
 
-You may read any path available to the current OS user. The parent and every Garcon-Amp specialist for this chat share the sandbox. Reuse any checkout, source, or artifact named in the request or already present there; never duplicate one that is safe and usable for the requested operation. Only when the role prompt permits investigative writes, put them in the shared sandbox and give new artifacts distinct names. Acquire any source only when the role prompt permits it, the current request requires it, and no available source is safe and usable for that permitted operation; keep it at an absolute path in the shared sandbox and report its origin and path. Do not intentionally modify the target repository or its Git state, and do not delegate to another agent.
+You may read any path available to the current OS user. The parent and every Garcon-Amp specialist for this chat share the sandbox. Reuse any checkout, source, or artifact named in the request or already present there; never duplicate one that is safe and usable for the requested operation. Only when the role prompt permits investigative writes, put them in the shared sandbox and give new artifacts distinct names. Acquire any source only when the role prompt permits it, the current request requires it, and no available source is safe and usable for that permitted operation; keep it at an absolute path in the shared sandbox and report its origin and path. Do not intentionally modify the target repository or its Git state.
 
 Do not put artifacts or target checkouts in the launch-only directory. Return a complete result; no one can answer questions during this invocation.
 
@@ -1398,6 +1406,76 @@ process.stdout.write(`model_instructions_file=${JSON.stringify(Bun.argv[1])}`);
 ' "$policy_prompt_path"
 }
 
+render_codex_skills_override() {
+  bun -e '
+import path from "node:path";
+import { homedir } from "node:os";
+import { readdir, realpath, stat } from "node:fs/promises";
+
+const [cwd, configuredCodexHome] = Bun.argv.slice(1);
+const userHome = homedir();
+const codexHome = configuredCodexHome || path.join(userHome, ".codex");
+const roots = [
+  path.join(codexHome, "skills"),
+  path.join(codexHome, "skills", ".system"),
+  path.join(userHome, ".agents", "skills"),
+  "/etc/codex/skills",
+];
+for (let directory = cwd; ; directory = path.dirname(directory)) {
+  roots.push(path.join(directory, ".agents", "skills"));
+  roots.push(path.join(directory, ".codex", "skills"));
+  if (directory === path.dirname(directory)) break;
+}
+
+const missing = (error) => error?.code === "ENOENT" || error?.code === "ENOTDIR";
+const visitedDirectories = new Set();
+const skillPaths = new Set();
+
+const walk = async (directory, isRoot = false) => {
+  let canonicalDirectory;
+  try {
+    canonicalDirectory = await realpath(directory);
+  } catch (error) {
+    if (isRoot && missing(error)) return;
+    throw error;
+  }
+  if (visitedDirectories.has(canonicalDirectory)) return;
+  visitedDirectories.add(canonicalDirectory);
+
+  const entries = await readdir(canonicalDirectory, { withFileTypes: true });
+  const skillPath = path.join(canonicalDirectory, "SKILL.md");
+  try {
+    if ((await stat(skillPath)).isFile()) {
+      skillPaths.add(await realpath(skillPath));
+    }
+  } catch (error) {
+    if (!missing(error)) throw error;
+  }
+
+  for (const entry of entries) {
+    if (entry.name.startsWith(".")) continue;
+    const entryPath = path.join(canonicalDirectory, entry.name);
+    if (entry.isDirectory()) {
+      await walk(entryPath);
+    } else if (entry.isSymbolicLink() && (await stat(entryPath)).isDirectory()) {
+      await walk(entryPath);
+    }
+  }
+};
+
+try {
+  for (const root of roots) await walk(root, true);
+  const entries = [...skillPaths]
+    .sort()
+    .map((skillPath) => `{path=${JSON.stringify(skillPath)},enabled=false}`);
+  process.stdout.write(`skills.config=[${entries.join(",")}]`);
+} catch (error) {
+  console.error(`Codex skill enumeration failed: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+}
+' "$INVOCATION_PATH" "${CODEX_HOME:-}"
+}
+
 render_opencode_config() {
   bun -e '
 const [baseConfig, agentName, promptPath] = Bun.argv.slice(1);
@@ -1413,7 +1491,30 @@ process.stdout.write(JSON.stringify(config));
 }
 
 run_codex() {
-  local events_file model_instructions_file response_file sandbox_mode=danger-full-access status
+  local events_file mcp_override model_instructions_file response_file sandbox_mode=danger-full-access
+  local skills_override status
+  local -a isolation_flags=(
+    --disable apps
+    --disable browser_use
+    --disable browser_use_external
+    --disable browser_use_full_cdp_access
+    --disable computer_use
+    --disable enable_mcp_apps
+    --disable external_agent_memory_import
+    --disable goals
+    --disable hooks
+    --disable in_app_browser
+    --disable memories
+    --disable multi_agent
+    --disable multi_agent_v2
+    --disable plugins
+    --disable recommended_plugins
+    --disable remote_plugin
+    --disable skill_mcp_dependency_install
+    --disable skill_search
+    --disable tool_suggest
+    --enable skip_host_skill_discovery
+  )
   local -a command=(codex)
 
   if [[ "$ROLE" == finder ]]; then sandbox_mode=read-only; fi
@@ -1428,7 +1529,34 @@ run_codex() {
   fi
   model_instructions_file="$(render_codex_model_instructions_file)" || return
   command+=(-c "$model_instructions_file")
+  skills_override="$(render_codex_skills_override)" || return
   command+=(
+    -c "$skills_override"
+    -c skills.include_instructions=false
+    -c skills.bundled.enabled=false
+  )
+  mcp_override="$({
+    cd "$INVOCATION_PATH"
+    codex mcp list --json "${isolation_flags[@]}"
+  } | bun -e '
+let servers;
+try {
+  servers = await new Response(Bun.stdin.stream()).json();
+} catch {
+  console.error("Codex emitted an invalid MCP server list");
+  process.exit(1);
+}
+if (!Array.isArray(servers) || servers.some((server) => typeof server?.name !== "string" || !server.name)) {
+  console.error("Codex emitted an invalid MCP server list");
+  process.exit(1);
+}
+const names = [...new Set(servers.map((server) => server.name))].sort();
+const disabled = names.map((name) => `${JSON.stringify(name)}={enabled=false}`);
+process.stdout.write(`mcp_servers={${disabled.join(",")}}`);
+')" || return
+  command+=(-c "$mcp_override")
+  command+=(
+    "${isolation_flags[@]}"
     --ask-for-approval never
     --sandbox "$sandbox_mode"
     --cd "$INVOCATION_PATH"
@@ -1445,6 +1573,7 @@ run_codex() {
   set +e
   (
     cd "$INVOCATION_PATH"
+    export GARCON_AMP_SPECIALIST_DEPTH=1
     print_invocation_prompt | "${command[@]}" -
   ) >"$events_file"
   status=$?
@@ -1490,7 +1619,13 @@ run_claude() {
     --safe-mode
     --model "$MODEL"
     --permission-mode dontAsk
+    --permission-prompts none
     --no-session-persistence
+    --strict-mcp-config
+    --mcp-config '{"mcpServers":{}}'
+    --disable-slash-commands
+    --disallowed-tools 'Agent,Task'
+    --no-chrome
     --append-system-prompt-file "$policy_prompt_path"
     --add-dir /
     --tools "$tool_names"
@@ -1509,6 +1644,7 @@ run_claude() {
   set +e
   (
     cd "$INVOCATION_PATH"
+    export GARCON_AMP_SPECIALIST_DEPTH=1
     print_invocation_prompt | "${clean_env[@]}" "${command[@]}"
   )
   status=$?
@@ -1530,6 +1666,7 @@ run_pi() {
     --tools "$tool_names"
     --no-skills
     --no-prompt-templates
+    --no-themes
     --no-context-files
     --append-system-prompt "$policy_prompt_path"
     --no-approve
@@ -1541,6 +1678,7 @@ run_pi() {
   set +e
   (
     cd "$INVOCATION_PATH"
+    export GARCON_AMP_SPECIALIST_DEPTH=1
     print_invocation_prompt | "${command[@]}"
   )
   status=$?
@@ -1552,6 +1690,24 @@ run_pi() {
 run_opencode() {
   local events_file export_error_file export_file response_file session_file session_id
   local status parse_status export_status opencode_config_json
+  local -a isolated_env=(
+    env
+    GARCON_AMP_SPECIALIST_DEPTH=1
+    OPENCODE_AUTO_SHARE=false
+    OPENCODE_DISABLE_CLAUDE_CODE=true
+    OPENCODE_DISABLE_EXTERNAL_SKILLS=true
+    OPENCODE_DISABLE_LSP_DOWNLOAD=true
+    OPENCODE_DISABLE_PROJECT_CONFIG=true
+    OPENCODE_ENABLE_PARALLEL=false
+    OPENCODE_ENABLE_QUESTION_TOOL=false
+    OPENCODE_EXPERIMENTAL=false
+    OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false
+    OPENCODE_EXPERIMENTAL_CODE_MODE=false
+    OPENCODE_EXPERIMENTAL_EVENT_SYSTEM=false
+    OPENCODE_EXPERIMENTAL_PARALLEL=false
+    OPENCODE_EXPERIMENTAL_PLAN_MODE=false
+    OPENCODE_EXPERIMENTAL_WORKSPACES=false
+  )
   local -a command=(
     opencode run
     --pure
@@ -1584,7 +1740,8 @@ run_opencode() {
   set +e
   (
     cd "$INVOCATION_PATH"
-    print_invocation_prompt | env OPENCODE_CONFIG_CONTENT="$opencode_config_json" "${command[@]}"
+    print_invocation_prompt \
+      | "${isolated_env[@]}" OPENCODE_CONFIG_CONTENT="$opencode_config_json" "${command[@]}"
   ) >"$events_file"
   status=$?
   set -e
@@ -1635,7 +1792,7 @@ await Bun.write(sessionPath, sessionID);
   # OpenCode can truncate large exports on a pipe; direct regular-file output is required.
   (
     cd "$INVOCATION_PATH"
-    env OPENCODE_CONFIG_CONTENT="$opencode_config_json" \
+    "${isolated_env[@]}" OPENCODE_CONFIG_CONTENT="$opencode_config_json" \
       opencode export --pure "$session_id" </dev/null
   ) >"$export_file" 2>"$export_error_file"
   export_status=$?
