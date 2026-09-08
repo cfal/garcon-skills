@@ -928,6 +928,26 @@ format_elapsed() {
   fi
 }
 
+format_response_duration() {
+  local total=$1 hours minutes
+  (( total >= 0 )) || total=0
+  if (( total < 60 )); then
+    printf '%ds' "$total"
+    return
+  fi
+  hours=$(( total / 3600 ))
+  minutes=$(( (total % 3600) / 60 ))
+  if (( hours > 0 )); then
+    if (( minutes > 0 )); then
+      printf '%dh%dm' "$hours" "$minutes"
+    else
+      printf '%dh' "$hours"
+    fi
+  else
+    printf '%dm' "$minutes"
+  fi
+}
+
 title_with_spec() {
   local base=$1
   bun -e '
@@ -980,17 +1000,19 @@ print_callback_result() {
 }
 
 send_callback() {
-  local status=$1 bytes=$2 elapsed run_id output
+  local status=$1 bytes=$2 duration elapsed elapsed_seconds run_id output
   local callback_title fallback_title send_status=0 fallback_status=0
   local -a callback_command callback_presentation
   load_run_state
-  elapsed="$(format_elapsed "$(( EPOCHSECONDS - ${run_state[startedAt]:-$EPOCHSECONDS} ))")"
+  elapsed_seconds=$(( ${run_state[finishedAt]:-$EPOCHSECONDS} - ${run_state[startedAt]:-$EPOCHSECONDS} ))
+  duration="$(format_response_duration "$elapsed_seconds")"
+  elapsed="$(format_elapsed "$elapsed_seconds")"
   run_id="${run_state[runId]:-unknown}"
   if (( status == 0 )); then
-    callback_title="$ROLE_ACTIVITY_TITLE response (async)"
+    callback_title="$ROLE_ACTIVITY_TITLE response in $duration (async)"
     callback_presentation=(--color "$ROLE_ACCENT")
   else
-    callback_title="$ROLE_ACTIVITY_TITLE failed (async)"
+    callback_title="$ROLE_ACTIVITY_TITLE failed in $duration (async)"
     callback_presentation=(--message-style error)
   fi
   callback_title="$(title_with_spec "$callback_title")"
@@ -1010,7 +1032,7 @@ send_callback() {
   if (( send_status != 0 )) || [[ "$output" != *"chat id: $CHAT_ID"* ]]; then
     printf '%s: callback delivery failed: %s\n' "$ROLE" "$output" >&2
     if (( status == 0 )); then
-      fallback_title="$(title_with_spec "$ROLE_ACTIVITY_TITLE response (callback failed)")"
+      fallback_title="$(title_with_spec "$ROLE_ACTIVITY_TITLE response in $duration (callback failed)")"
       add_transcript_rows \
         "$fallback_title" "$RESPONSE_FILE" \
         || fallback_status=$?
@@ -2028,7 +2050,9 @@ fi
 
 response_row_status=0
 if [[ "$mode" == blocking ]]; then
-  response_title="$ROLE_ACTIVITY_TITLE response"
+  load_run_state
+  response_duration="$(format_response_duration "$(( EPOCHSECONDS - ${run_state[startedAt]:-$EPOCHSECONDS} ))")"
+  response_title="$ROLE_ACTIVITY_TITLE response in $response_duration"
   if [[ "$run_outcome" == partial ]]; then
     response_title+=" ($reviewer_success_count of $reviewer_count reviewers)"
   elif [[ -n "$group_title_detail" ]]; then

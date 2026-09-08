@@ -241,7 +241,8 @@ await appendFile(process.env.GARCON_AMP_TEST_ROW_LOG, JSON.stringify({
 }) + '\\n');
 
 if (args[0] === 'resume-async') {
-  const failed = messageTitle?.includes(' failed (async') ?? false;
+  const failed = messageTitle !== null
+    && / failed in \\d+(?:s|m|h(?:\\d+m)?) \\(async\\)/.test(messageTitle);
   const validPresentation = failed
     ? messageStyle === 'error' && color === null
     : messageStyle === null && color !== null;
@@ -855,8 +856,32 @@ async function allRowCalls() {
   return readJsonLines(rowLogPath);
 }
 
-async function rowCalls() {
-  return (await allRowCalls()).filter((row) => !setupNoticeTitles.has(row.title));
+function stripResponseDuration(value: unknown) {
+  // Timed titles have a smaller spec budget. Keep the duration when asserting truncated labels.
+  return typeof value === 'string'
+    ? value.replace(/ (response|failed) in \d+(?:s|m|h(?:\d+m)?)(?= \(| \[|$)/, ' $1')
+    : value;
+}
+
+function responseDurationFromTitle(title: string) {
+  const duration = title.match(
+    / (?:response|failed) in (\d+(?:s|m|h(?:\d+m)?))(?= \(| \[|$)/,
+  )?.[1];
+  if (duration === undefined) throw new Error(`response title has no duration: ${title}`);
+  return duration;
+}
+
+async function rowCalls(options: { keepResponseDuration?: boolean } = {}) {
+  const rows = (await allRowCalls()).filter((row) => !setupNoticeTitles.has(row.title));
+  if (options.keepResponseDuration) return rows;
+  return rows.map((row) => ({
+    ...row,
+    args: row.args.map(stripResponseDuration),
+    title: stripResponseDuration(row.title),
+    ...(row.messageTitle === undefined
+      ? {}
+      : { messageTitle: stripResponseDuration(row.messageTitle) }),
+  }));
 }
 
 async function setupNoticeRows() {
@@ -961,6 +986,19 @@ function expectedTranscriptTitle(base: string, specs: readonly string[]) {
     ? `${codePoints.slice(0, availableCodePoints - 1).join('')}…`
     : codePoints.join('');
   return `${prefix}${label}]`;
+}
+
+function expectedTimedTranscriptTitle(
+  base: string,
+  specs: readonly string[],
+  actualTitle: string,
+) {
+  const duration = responseDurationFromTitle(actualTitle);
+  const timedBase = base.replace(
+    / (response|failed)(?= \(|$)/,
+    ` $1 in ${duration}`,
+  );
+  return expectedTranscriptTitle(timedBase, specs);
 }
 
 function callbackArguments(
@@ -3993,6 +4031,59 @@ describe('generated adapters', () => {
     }
   });
 
+  test('adds compact elapsed durations to response titles', async () => {
+    const { chatId, statePath } = newChatId();
+    expect((await setup(chatId)).exitCode).toBe(0);
+    const launcher = path.join(statePath, 'oracle');
+    const runPath = path.join(statePath, '.oracle.run.json');
+
+    expect((await run([launcher, 'Measure a blocking consultation.'])).exitCode).toBe(0);
+    const blockingTitle = (await rowCalls({ keepResponseDuration: true })).at(-1).title;
+    expect(blockingTitle).toMatch(/ response in \d+s /);
+    expect(blockingTitle).toBe(
+      expectedTimedTranscriptTitle(
+        'Oracle response',
+        [defaultRoleSpecLabels.Oracle],
+        blockingTitle,
+      ),
+    );
+
+    const cases = [
+      { ageSeconds: 20, expected: (elapsed: number) => `${elapsed}s` },
+      { ageSeconds: 30 * 60 + 10, expected: () => '30m' },
+      { ageSeconds: 60 * 60 + 10, expected: () => '1h' },
+      { ageSeconds: 2 * 60 * 60 + 10 * 60 + 10, expected: () => '2h10m' },
+    ];
+    for (const [index, duration] of cases.entries()) {
+      await writeFile(rowLogPath, '');
+      expect((await run([
+        launcher,
+        '--start',
+        `Measure detached consultation ${index + 1}.`,
+      ], {
+        env: {
+          GARCON_AMP_TEST_DELAY_DRIVER: defaultRoleAgents.Oracle,
+          GARCON_AMP_TEST_DELAY_MS: '750',
+        },
+      })).exitCode).toBe(0);
+
+      const running = await runState(statePath, 'oracle');
+      expect(running.status).toBe('running');
+      running.startedAt = Math.floor(Date.now() / 1000) - duration.ageSeconds;
+      const temporaryRunPath = `${runPath}.test`;
+      await writeFile(temporaryRunPath, `${JSON.stringify(running, null, 2)}\n`);
+      await rename(temporaryRunPath, runPath);
+
+      const finished = await waitForRunEnd(statePath, 'oracle');
+      const elapsed = finished.finishedAt - finished.startedAt;
+      const expectedDuration = duration.expected(elapsed);
+      const callbackTitle = (await rowCalls({ keepResponseDuration: true })).at(-1).messageTitle;
+      expect(callbackTitle).toBe(
+        `Oracle response in ${expectedDuration} (async) [${defaultRoleSpecLabels.Oracle}]`,
+      );
+    }
+  }, 10_000);
+
   test('runs a self-retrieving Reporter through every supported adapter', async () => {
     const nativeTranscript = path.join(fixturePath, 'native transcript.jsonl');
     const goal = [
@@ -4869,14 +4960,18 @@ describe('generated adapters', () => {
     ].join('\n');
     expect(await readFile(path.join(statePath, '.oracle.last-response'), 'utf8')).toBe(aggregate);
 
-    const rows = await rowCalls();
+    const rows = await rowCalls({ keepResponseDuration: true });
     expect(rows).toHaveLength(2);
     expect(rows[0]).toMatchObject({
       title: expectedTranscriptTitle('Oracle review request (async)', reviewerSpecs),
       content: prompt,
     });
     expect(rows[1]).toMatchObject({
-      messageTitle: expectedTranscriptTitle('Oracle review response (async)', reviewerSpecs),
+      messageTitle: expectedTimedTranscriptTitle(
+        'Oracle review response (async)',
+        reviewerSpecs,
+        rows[1].messageTitle,
+      ),
       color: roleAccents.Oracle,
       collapsible: true,
     });
@@ -4940,10 +5035,15 @@ describe('generated adapters', () => {
       reviewers: 3,
     });
     expect(await calls()).toHaveLength(3);
-    expect((await rowCalls()).map((row) => row.title)).toEqual([
+    const completedRows = await rowCalls({ keepResponseDuration: true });
+    expect(completedRows[0].title).toBe(
       expectedTranscriptTitle('Oracle request (3 reviewers)', reviewers),
-      expectedTranscriptTitle('Oracle response (3 reviewers)', reviewers),
-    ]);
+    );
+    expect(completedRows[1].title).toBe(expectedTimedTranscriptTitle(
+      'Oracle response (3 reviewers)',
+      reviewers,
+      completedRows[1].title,
+    ));
 
     await writeFile(logPath, '');
     await writeFile(rowLogPath, '');
@@ -4951,10 +5051,15 @@ describe('generated adapters', () => {
       env: { GARCON_AMP_TEST_MODE: 'codex-fail' },
     });
     expect(partial.exitCode).toBe(0);
-    expect((await rowCalls()).map((row) => row.title)).toEqual([
+    const partialRows = await rowCalls({ keepResponseDuration: true });
+    expect(partialRows[0].title).toBe(
       expectedTranscriptTitle('Oracle request (3 reviewers)', reviewers),
-      expectedTranscriptTitle('Oracle response (2 of 3 reviewers)', reviewers),
-    ]);
+    );
+    expect(partialRows[1].title).toBe(expectedTimedTranscriptTitle(
+      'Oracle response (2 of 3 reviewers)',
+      reviewers,
+      partialRows[1].title,
+    ));
   });
 
   test('uses repeated --spec values as the complete group with --no-defaults', async () => {
@@ -5037,12 +5142,16 @@ describe('generated adapters', () => {
       '',
     ].join('\n'));
 
-    const rows = await rowCalls();
+    const rows = await rowCalls({ keepResponseDuration: true });
     expect(rows[0].title).toBe(
       expectedTranscriptTitle('Oracle request (async)', reviewerSpecs),
     );
     expect(rows[1].messageTitle).toBe(
-      expectedTranscriptTitle('Oracle response (async)', reviewerSpecs),
+      expectedTimedTranscriptTitle(
+        'Oracle response (async)',
+        reviewerSpecs,
+        rows[1].messageTitle,
+      ),
     );
   });
 
