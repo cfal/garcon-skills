@@ -13,7 +13,7 @@ Use only these generated launchers. Never invoke their underlying coding-agent C
 
 ## Brief
 
-Split mixed requests by the role boundaries in `SKILL.md`. Give specialists complete, self-contained tasks. Never ask them to invoke a skill or another agent. Brief each specialist with the exact objective, absolute targets, relevant revision or diff, known evidence, constraints, test results or failures, shared artifacts, and changes since any prior consultation.
+Split mixed requests by the role boundaries in `SKILL.md`. Every launcher call starts a fresh specialist conversation with no prior request or response, even when reusing the same role path. Make every request complete and self-contained; restate all relevant earlier context, not only the follow-up or delta. Never ask specialists to invoke a skill or another agent. Brief each specialist with the exact objective, absolute targets, relevant revision or diff, known evidence, constraints, test results or failures, shared artifacts, and changes since any prior consultation.
 
 For Reporter, pass source locators—not a summary: 16-digit Garcon chat IDs, absolute native transcript paths, or delimited inline content. Use it for this chat only after compaction or when long history impedes retrieval.
 
@@ -47,7 +47,7 @@ Every request is copied into the user-visible Garcon transcript. Include secrets
 
 ## Results and recovery
 
-Exit 0 from a blocking call returns its complete result. A nonzero exit may still print complete or partial output; inspect stdout before relaunching. A live continuation or process handle has not exited: resume it, never call `--status` or relaunch. Exit 3 means the role is busy.
+Exit 0 from a blocking call returns its complete result. A nonzero exit may still print complete or partial output; inspect stdout before relaunching. A still-running host tool or process handle belongs to the current invocation: resume that handle, never call `--status` or relaunch. Exit 3 means the role is busy.
 
 Use `--start` for reviews and uncertain or long calls; block only when completion is expected within one tool wait. Startup only confirms launch. Continue only independent work on stable targets or end the turn for the callback. Never begin dependent work or poll with `--status`.
 

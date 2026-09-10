@@ -113,8 +113,17 @@ describe('skill activation protocol', () => {
       expect(orchestrator).toContain(requiredPhrase);
     }
     expect(orchestrator).toContain('Split mixed requests by the role boundaries in `SKILL.md`');
-    expect(orchestrator).toContain('Give specialists complete, self-contained tasks');
-    expect(orchestrator).toContain('Never ask them to invoke a skill or another agent');
+    expect(orchestrator).toContain(
+      'Every launcher call starts a fresh specialist conversation with no prior request or response',
+    );
+    expect(orchestrator).toContain('even when reusing the same role path');
+    expect(orchestrator).toContain(
+      'restate all relevant earlier context, not only the follow-up or delta',
+    );
+    expect(orchestrator).toContain('Never ask specialists to invoke a skill or another agent');
+    expect(orchestrator).toContain(
+      'A still-running host tool or process handle belongs to the current invocation',
+    );
     expect(orchestrator).not.toContain('Prefer blocking calls');
     expect(orchestrator).not.toContain('Without independent work, wait once');
   });
