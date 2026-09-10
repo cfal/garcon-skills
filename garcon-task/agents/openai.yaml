@@ -1,0 +1,4 @@
+interface:
+  display_name: "Garcon Task"
+  short_description: "Start, resume, stop, or remove delegated child chats"
+  default_prompt: "Use $garcon-task to manage a delegated Garcon child through the requested lifecycle action."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Garcon Schedule"
+  short_description: "Schedule prompts for the current Garcon chat"
+  default_prompt: "Use $garcon-schedule to schedule this prompt in the current Garcon chat."

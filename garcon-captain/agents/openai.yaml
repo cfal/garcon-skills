@@ -1,0 +1,4 @@
+interface:
+  display_name: "Garcon Captain"
+  short_description: "Coordinate and manage work across Garcon chats"
+  default_prompt: "Use $garcon-captain to find relevant Garcon chats and coordinate the next work."
