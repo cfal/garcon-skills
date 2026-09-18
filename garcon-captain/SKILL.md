@@ -35,7 +35,7 @@ Use the user's `--workspace`, `--config-dir`, and `--server` when supplied. Othe
 
 ## Choose The Surface
 
-- For chat discovery, transcript research, starts, resumptions, monitoring, permissions, or metadata, read [references/cli.md](references/cli.md).
+- For chat discovery, transcript research, starts, resumptions, monitoring, permissions, or metadata, read [cli.md](cli.md).
 - For in-band peer messages use `$garcon-message`; for delegated-child starts and resumptions use `$garcon-task`; for scheduled prompts use `$garcon-schedule`.
 - To obtain the current Garcon chat ID, emit `<garcon-get-chat-id />` at the physical beginning or end of an assistant message and accept only a Garcon-injected `<garcon-chat-id>[0-9]{16}</garcon-chat-id>`. Never infer it from host state.
 
