@@ -50,6 +50,7 @@ Load only the surface needed for the request.
 - Never claim absence when coverage is pending, failed, unindexed, unsupported, stale, timed out, or truncated. State the limitation and narrow, rebuild, wait, or retry as appropriate.
 - Verify a search hit with its view-fenced `read` command before quoting it or making a consequential claim. Use snippet timestamps for when a message was written; chat activity is a different clock.
 - Resume the relevant chat for follow-up work. Start a new chat for independent work, a different project or agent, or deliberate isolation. Record delegated parentage when a parent chat is known.
+- Fork when work should retain the source transcript but continue independently. Prefer a native fork; allow a frozen ledger fallback only when losing native-session continuity is acceptable.
 - Use synchronous start/resume when the answer is needed now. Use asynchronous commands for parallel or detached work, then retain exact chat and turn IDs for `wait`, `status`, steering, or stopping.
 - A busy asynchronous resume fails without queueing unless `--allow-steer` is explicitly appropriate. Steering changes the active turn; do not use it merely to avoid waiting.
 - Inspect pending permission details and use every returned occurrence, run, and server-instance fence. Never guess structured question or option IDs.
