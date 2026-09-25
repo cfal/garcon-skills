@@ -107,12 +107,13 @@ Bundled defaults (defaults.conf):
   reporter=${bundledRoleDefaults.reporter}
 
 User profile/default files (first existing file wins):
-  $HOME/.garcon/garcon-amp.conf
+  $GARCON_CONFIG_DIR/garcon-amp.conf
+    (GARCON_CONFIG_DIR defaults to $HOME/.garcon)
   $HOME/.config/garcon-amp.conf
 
-When neither exists, setup creates $HOME/.garcon/garcon-amp.conf with the bundled
-configuration. Profiles use one header followed by four ordered assignments, with
-no blank or unrelated non-comment lines inside the block:
+When neither exists, setup creates garcon-amp.conf in the resolved Garcon config
+directory with the bundled configuration. Profiles use one header followed by four ordered assignments,
+with no blank or unrelated non-comment lines inside the block:
 
   [profile:<name>]
   oracle=<spec-or-alias>
@@ -157,10 +158,6 @@ const instructionsEndMarker = 'GARCON-AMP INSTRUCTIONS END';
 const instructionsMaxBytes = 12 * 1024;
 const activeConfigFileName = 'garcon-amp.conf';
 const installationFileName = '.installation.json';
-const userRoleDefaultsRelativePaths = [
-  '.garcon/garcon-amp.conf',
-  '.config/garcon-amp.conf',
-];
 const initializationNoticeTitle = 'Garcon-Amp initialized';
 const reinitializationNoticeTitle = 'Garcon-Amp re-initialized';
 const noRoleChangesNotice = 'No changes';
@@ -789,10 +786,17 @@ async function resolvePotentialPath(filePath) {
 async function readUserRoleDefaults() {
   const home = process.env.HOME;
   if (!home) fail('HOME is not set; cannot resolve role defaults file');
-  let defaultsPath = path.join(home, userRoleDefaultsRelativePaths[0]);
+  const configuredDirectory = process.env.GARCON_CONFIG_DIR || path.join(home, '.garcon');
+  if (!configuredDirectory.trim()) {
+    fail('GARCON_CONFIG_DIR must be a non-empty directory path');
+  }
+  const candidatePaths = [
+    path.join(path.resolve(configuredDirectory), activeConfigFileName),
+    path.join(home, '.config', activeConfigFileName),
+  ];
+  let defaultsPath = candidatePaths[0];
   let info;
-  for (const candidateRelativePath of userRoleDefaultsRelativePaths) {
-    const candidatePath = path.join(home, candidateRelativePath);
+  for (const candidatePath of candidatePaths) {
     let candidateInfo;
     try {
       candidateInfo = await requireOwnedRegularFileIfPresent(
@@ -807,6 +811,7 @@ async function readUserRoleDefaults() {
     info = candidateInfo;
     break;
   }
+  assertInstructionValue('role defaults path', defaultsPath);
   if (!info) {
     return {
       aliases: bundledDefaults.aliases,
@@ -1534,8 +1539,20 @@ const roleNoticeContent = roles.map((role) => {
   const spec = role.configs.map(canonicalAgentSpec).join(',');
   return `${role.name}: ${markdownCodeSpan(spec)}`;
 }).join('  \n');
+let defaultsNoticeContent = '';
+if (userRoleDefaults.shouldCreate) {
+  defaultsNoticeContent = `\nCreated ${markdownCodeSpan(userRoleDefaults.path)} with defaults\n`;
+} else if (userRoleDefaults.aliasesUpgraded || userRoleDefaults.profileUpgraded) {
+  const addedSections = [
+    ...(userRoleDefaults.aliasesUpgraded ? ['[spec-alias]'] : []),
+    ...(userRoleDefaults.profileUpgraded ? ['[profile:default]'] : []),
+  ];
+  defaultsNoticeContent = `\nUpgraded ${markdownCodeSpan(userRoleDefaults.path)}: added ${
+    addedSections.map(markdownCodeSpan).join(', ')
+  }\n`;
+}
 const setupNoticeContent = setupChanged
-  ? `${roleNoticeContent}\n\nsandbox: ${markdownCodeSpan(sandboxPath)}\n`
+  ? `${roleNoticeContent}\n\nsandbox: ${markdownCodeSpan(sandboxPath)}\n${defaultsNoticeContent}`
   : `${noRoleChangesNotice}\n`;
 
 for (const artifact of generatedArtifacts) {

@@ -64,13 +64,27 @@ const bundledRoleAssignments = [
   '',
 ].join('\n');
 
-function setupSummaryNotice(assignments: string, sandboxPath: string) {
+function setupSummaryNotice(
+  assignments: string,
+  sandboxPath: string,
+  defaultsNotice?: string,
+) {
   const roleLines = assignments.trimEnd().split('\n').map((assignment) => {
     const separator = assignment.indexOf('=');
     if (separator === -1) throw new Error(`invalid role assignment: ${assignment}`);
     return `${assignment.slice(0, separator)}: \`${assignment.slice(separator + 1)}\``;
   });
-  return `${roleLines.join('  \n')}\n\nsandbox: \`${sandboxPath}\`\n`;
+  return `${roleLines.join('  \n')}\n\nsandbox: \`${sandboxPath}\`\n${
+    defaultsNotice === undefined ? '' : `\n${defaultsNotice}\n`
+  }`;
+}
+
+function createdDefaultsNotice(defaultsPath: string) {
+  return `Created \`${defaultsPath}\` with defaults`;
+}
+
+function upgradedDefaultsNotice(defaultsPath: string, sections: string[]) {
+  return `Upgraded \`${defaultsPath}\`: added ${sections.map((section) => `\`${section}\``).join(', ')}`;
 }
 
 function userDefaultsWithSandbox(sandboxPath: string) {
@@ -726,6 +740,7 @@ async function createBin(selectedAgents: readonly string[]) {
 function testEnvironment(binPath: string, extra: Record<string, string> = {}) {
   const environment = { ...process.env };
   delete environment.GARCON_AMP_SPECIALIST_DEPTH;
+  delete environment.GARCON_CONFIG_DIR;
 
   return {
     ...environment,
@@ -1153,14 +1168,15 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     expect(result.stdout).not.toContain('--hide-full-request');
     expect(result.stdout).toContain(`librarian=${bundledRoleDefaults.librarian}`);
     expect(result.stdout).toContain(`reporter=${bundledRoleDefaults.reporter}`);
-    const preferredConfigIndex = result.stdout.indexOf('$HOME/.garcon/garcon-amp.conf');
+    const preferredConfigIndex = result.stdout.indexOf('$GARCON_CONFIG_DIR/garcon-amp.conf');
     const fallbackConfigIndex = result.stdout.indexOf('$HOME/.config/garcon-amp.conf');
     expect(preferredConfigIndex).toBeGreaterThan(-1);
     expect(fallbackConfigIndex).toBeGreaterThan(preferredConfigIndex);
+    expect(result.stdout).toContain('GARCON_CONFIG_DIR defaults to $HOME/.garcon');
     expect(result.stdout).toContain('$HOME/.config/garcon-amp.conf');
     expect(result.stdout).not.toContain('$HOME/garcon-amp.conf');
     expect(result.stdout).toContain(
-      'When neither exists, setup creates $HOME/.garcon/garcon-amp.conf',
+      'When neither exists, setup creates garcon-amp.conf in the resolved Garcon config',
     );
     expect(result.stdout).toContain('[spec-alias]\n  <name>=<agent-spec-prefix>');
     expect(result.stdout).toContain('one header followed by four ordered assignments');
@@ -1510,7 +1526,10 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       'librarian=codex:legacy-librarian:minimal',
       'reporter=codex:legacy-reporter:high',
       '',
-    ].join('\n'), path.join(combined.statePath, 'sandbox')));
+    ].join('\n'), path.join(combined.statePath, 'sandbox'), upgradedDefaultsNotice(
+      combinedPath,
+      ['[spec-alias]', '[profile:default]'],
+    )));
 
     await writeFile(rowLogPath, '');
     const aliasesOnlyHome = await mkdtemp(path.join(fixturePath, 'alias-upgrade-home-'));
@@ -1547,7 +1566,10 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       'librarian=codex:alias-only-librarian:minimal',
       'reporter=codex:alias-only-reporter:high',
       '',
-    ].join('\n'), path.join(aliasesOnly.statePath, 'sandbox')));
+    ].join('\n'), path.join(aliasesOnly.statePath, 'sandbox'), upgradedDefaultsNotice(
+      aliasesOnlyPath,
+      ['[spec-alias]'],
+    )));
 
     await writeFile(rowLogPath, '');
     const mixedHome = await mkdtemp(path.join(fixturePath, 'mixed-alias-home-'));
@@ -1833,9 +1855,9 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     expect(await pathExists(duplicate.statePath)).toBe(false);
   });
 
-  test('prefers the Garcon role defaults file without bypassing an unsafe one', async () => {
+  test('prefers GARCON_CONFIG_DIR role defaults without bypassing an unsafe one', async () => {
     const configuredHome = await mkdtemp(path.join(fixturePath, 'preferred-config-home-'));
-    const preferredDirectory = path.join(configuredHome, '.garcon');
+    const preferredDirectory = path.join(configuredHome, 'custom-garcon-config');
     const fallbackDirectory = path.join(configuredHome, '.config');
     await mkdir(preferredDirectory);
     await mkdir(fallbackDirectory);
@@ -1855,7 +1877,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
 
     expect((await setup(preferred.chatId, [], {
       binPath: codexBinPath,
-      env: { HOME: configuredHome },
+      env: { HOME: configuredHome, GARCON_CONFIG_DIR: preferredDirectory },
     })).exitCode).toBe(0);
     expect(await activeRoleSpecs(preferred.statePath)).toEqual({
       oracle: 'codex:preferred-oracle:high',
@@ -1866,7 +1888,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     expect(await readFile(fallbackPath, 'utf8')).toBe('invalid fallback content\n');
 
     const unsafeHome = await mkdtemp(path.join(fixturePath, 'unsafe-preferred-config-home-'));
-    const unsafePreferredDirectory = path.join(unsafeHome, '.garcon');
+    const unsafePreferredDirectory = path.join(unsafeHome, 'custom-garcon-config');
     const unsafeFallbackDirectory = path.join(unsafeHome, '.config');
     await mkdir(unsafePreferredDirectory);
     await mkdir(unsafeFallbackDirectory);
@@ -1879,7 +1901,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     const unsafe = newChatId();
     const unsafeResult = await setup(unsafe.chatId, [], {
       binPath: codexBinPath,
-      env: { HOME: unsafeHome },
+      env: { HOME: unsafeHome, GARCON_CONFIG_DIR: unsafePreferredDirectory },
     });
     expect(unsafeResult.exitCode).toBe(2);
     expect(unsafeResult.stderr).toContain('refusing unsafe role defaults file');
@@ -1888,7 +1910,8 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
 
   test('reports preferred config lookup failures without falling through', async () => {
     const configuredHome = await mkdtemp(path.join(fixturePath, 'blocked-preferred-config-home-'));
-    await writeFile(path.join(configuredHome, '.garcon'), 'not a directory\n');
+    const configuredGarconDirectory = path.join(configuredHome, 'blocked-garcon-config');
+    await writeFile(configuredGarconDirectory, 'not a directory\n');
     await mkdir(path.join(configuredHome, '.config'));
     await writeFile(
       path.join(configuredHome, '.config', 'garcon-amp.conf'),
@@ -1896,17 +1919,59 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     );
     const { chatId, statePath } = newChatId();
 
-    const result = await setup(chatId, [], { env: { HOME: configuredHome } });
+    const result = await setup(chatId, [], {
+      env: { HOME: configuredHome, GARCON_CONFIG_DIR: configuredGarconDirectory },
+    });
     expect(result.exitCode).toBe(2);
     expect(result.stderr).toContain(
-      `cannot inspect role defaults file: ${configuredHome}/.garcon/garcon-amp.conf`,
+      `cannot inspect role defaults file: ${configuredGarconDirectory}/garcon-amp.conf`,
     );
     expect(result.stderr).not.toContain('\n    at ');
     expect(await pathExists(statePath)).toBe(false);
   });
 
+  test('matches Garcon config-directory handling for empty, relative, and blank values', async () => {
+    const emptyHome = await mkdtemp(path.join(fixturePath, 'empty-garcon-config-home-'));
+    const empty = newChatId();
+    expect((await setup(empty.chatId, [], {
+      env: { HOME: emptyHome, GARCON_CONFIG_DIR: '' },
+    })).exitCode).toBe(0);
+    expect(await pathExists(path.join(emptyHome, '.garcon', 'garcon-amp.conf'))).toBe(true);
+
+    const relativeHome = await mkdtemp(path.join(fixturePath, 'relative-garcon-config-home-'));
+    const relative = newChatId();
+    const relativeResult = await run([
+      setupPath,
+      relative.chatId,
+      '--garcon-path',
+      garconPath,
+    ], {
+      cwd: relativeHome,
+      env: { HOME: relativeHome, GARCON_CONFIG_DIR: 'relative-config' },
+    });
+    expect(relativeResult.exitCode).toBe(0);
+    expect(await pathExists(path.join(relativeHome, 'relative-config', 'garcon-amp.conf')))
+      .toBe(true);
+
+    const blankHome = await mkdtemp(path.join(fixturePath, 'blank-garcon-config-home-'));
+    const blank = newChatId();
+    const blankResult = await setup(blank.chatId, [], {
+      env: { HOME: blankHome, GARCON_CONFIG_DIR: '   ' },
+    });
+    expect(blankResult.exitCode).toBe(2);
+    expect(blankResult.stderr).toContain(
+      'GARCON_CONFIG_DIR must be a non-empty directory path',
+    );
+    expect(await pathExists(blank.statePath)).toBe(false);
+  });
+
   test('falls back to the XDG role defaults file and publishes a notice on every setup', async () => {
     const configuredHome = await mkdtemp(path.join(fixturePath, 'configured-home-'));
+    const configuredGarconDirectory = path.join(configuredHome, 'custom-garcon-config');
+    const configuredEnvironment = {
+      HOME: configuredHome,
+      GARCON_CONFIG_DIR: configuredGarconDirectory,
+    };
     await mkdir(path.join(configuredHome, '.config'));
     const configuredDefaults = path.join(configuredHome, '.config', 'garcon-amp.conf');
     await writeFile(path.join(configuredHome, 'garcon-amp.conf'), [
@@ -1924,7 +1989,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     ].join('\n'));
 
     const { chatId, statePath } = newChatId();
-    const first = await setup(chatId, [], { env: { HOME: configuredHome } });
+    const first = await setup(chatId, [], { env: configuredEnvironment });
     expect(first.exitCode).toBe(0);
     expect(first.stdout).not.toContain('configured-oracle');
     expect(first.stdout).not.toContain('configured-finder');
@@ -1936,7 +2001,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       finder: 'pi:google:configured-finder:low',
       librarian: bundledRoleDefaults.librarian,
     });
-    expect(await pathExists(path.join(configuredHome, '.garcon', 'garcon-amp.conf')))
+    expect(await pathExists(path.join(configuredGarconDirectory, 'garcon-amp.conf')))
       .toBe(false);
     const activeRoleConfig = [
       'oracle=codex:configured-oracle:high',
@@ -1962,7 +2027,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     expect((await stat(path.join(statePath, 'garcon-amp.conf'))).mode & 0o777).toBe(0o600);
 
     await writeFile(rowLogPath, '');
-    const unchanged = await run([setupPath, chatId], { env: { HOME: configuredHome } });
+    const unchanged = await run([setupPath, chatId], { env: configuredEnvironment });
     expect(unchanged.exitCode).toBe(0);
     const unchangedNotices = await setupNoticeRows();
     expect(unchangedNotices).toHaveLength(1);
@@ -1981,7 +2046,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       `reporter=${bundledRoleDefaults.reporter}`,
       '',
     ].join('\n'));
-    const preserved = await run([setupPath, chatId], { env: { HOME: configuredHome } });
+    const preserved = await run([setupPath, chatId], { env: configuredEnvironment });
     expect(preserved.exitCode).toBe(0);
     const preservedNotices = await setupNoticeRows();
     expect(preservedNotices).toHaveLength(1);
@@ -1994,7 +2059,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     await writeFile(rowLogPath, '');
     const reset = await run(
       [setupPath, chatId, '--reset-defaults'],
-      { env: { HOME: configuredHome } },
+      { env: configuredEnvironment },
     );
     expect(reset.exitCode).toBe(0);
     expect(reset.stdout).not.toContain('configured-next');
@@ -2377,12 +2442,17 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
 
   test('creates bundled user defaults and reports changed setup after recreation', async () => {
     const configuredHome = await mkdtemp(path.join(fixturePath, 'preferred-config-home-'));
-    const defaultsPath = path.join(configuredHome, '.garcon', 'garcon-amp.conf');
+    const configuredGarconDirectory = path.join(configuredHome, 'custom-garcon-config');
+    const configuredEnvironment = {
+      HOME: configuredHome,
+      GARCON_CONFIG_DIR: configuredGarconDirectory,
+    };
+    const defaultsPath = path.join(configuredGarconDirectory, 'garcon-amp.conf');
     const ignoredLegacyPath = path.join(configuredHome, 'garcon-amp.conf');
     const ignoredLegacyDefaults = 'oracle=codex:ignored-legacy:high\n';
     await writeFile(ignoredLegacyPath, ignoredLegacyDefaults);
     const { chatId, statePath } = newChatId();
-    const result = await setup(chatId, [], { env: { HOME: configuredHome } });
+    const result = await setup(chatId, [], { env: configuredEnvironment });
     expect(result.exitCode).toBe(0);
     expect(await readFile(defaultsPath, 'utf8')).toBe(bundledRoleDefaultsContent);
     expect((await stat(defaultsPath)).mode & 0o777).toBe(0o600);
@@ -2393,19 +2463,27 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     expect(initialized).toHaveLength(1);
     expect(initialized[0].title).toBe('Garcon-Amp initialized');
     expect(initialized[0].content).toBe(
-      setupSummaryNotice(bundledRoleAssignments, path.join(statePath, 'sandbox')),
+      setupSummaryNotice(
+        bundledRoleAssignments,
+        path.join(statePath, 'sandbox'),
+        createdDefaultsNotice(defaultsPath),
+      ),
     );
 
     await writeFile(rowLogPath, '');
     await rm(defaultsPath);
-    const recreated = await run([setupPath, chatId], { env: { HOME: configuredHome } });
+    const recreated = await run([setupPath, chatId], { env: configuredEnvironment });
     expect(recreated.exitCode).toBe(0);
     expect(await readFile(defaultsPath, 'utf8')).toBe(bundledRoleDefaultsContent);
     const reinitialized = await setupNoticeRows();
     expect(reinitialized).toHaveLength(1);
     expect(reinitialized[0].title).toBe('Garcon-Amp re-initialized');
     expect(reinitialized[0].content).toBe(
-      setupSummaryNotice(bundledRoleAssignments, path.join(statePath, 'sandbox')),
+      setupSummaryNotice(
+        bundledRoleAssignments,
+        path.join(statePath, 'sandbox'),
+        createdDefaultsNotice(defaultsPath),
+      ),
     );
 
     await writeFile(rowLogPath, '');
@@ -2417,7 +2495,7 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
       '',
     ].join('\n');
     await writeFile(defaultsPath, userDefaults);
-    const preserved = await run([setupPath, chatId], { env: { HOME: configuredHome } });
+    const preserved = await run([setupPath, chatId], { env: configuredEnvironment });
     expect(preserved.exitCode).toBe(0);
     expect(await readFile(defaultsPath, 'utf8')).toBe([
       'default-profile=default',
@@ -2433,7 +2511,11 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     expect(preservedNotices).toHaveLength(1);
     expect(preservedNotices[0]).toMatchObject({
       title: 'Garcon-Amp re-initialized',
-      content: setupSummaryNotice(bundledRoleAssignments, path.join(statePath, 'sandbox')),
+      content: setupSummaryNotice(
+        bundledRoleAssignments,
+        path.join(statePath, 'sandbox'),
+        upgradedDefaultsNotice(defaultsPath, ['[profile:default]']),
+      ),
     });
   });
 
@@ -2640,7 +2722,11 @@ Exclude secrets not authorized for Garcon transcript visibility.`,
     expect(retryNotices).toHaveLength(1);
     expect(retryNotices[0].title).toBe('Garcon-Amp initialized');
     expect(retryNotices[0].content).toBe(
-      setupSummaryNotice(bundledRoleAssignments, path.join(statePath, 'sandbox')),
+      setupSummaryNotice(
+        bundledRoleAssignments,
+        path.join(statePath, 'sandbox'),
+        createdDefaultsNotice(path.join(homePath, '.garcon', 'garcon-amp.conf')),
+      ),
     );
     expect(await pathExists(path.join(statePath, 'garcon-amp.conf'))).toBe(true);
 

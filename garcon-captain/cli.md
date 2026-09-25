@@ -3,10 +3,12 @@
 Use `"${GARCON_CLI[@]}"` below. Put connection options before the command when needed:
 
 ```bash
-"${GARCON_CLI[@]}" --workspace "$WORKSPACE" --config-dir "$CONFIG_DIR" --server "$SERVER" <command>
+"${GARCON_CLI[@]}" --config-dir "$CONFIG_DIR" --runtime "$RUNTIME" --server "$SERVER" <command>
 ```
 
-Omit optional connection flags that the user did not supply. `--server` asserts the discovered workspace listener; it does not redirect credentials.
+Omit optional connection flags that the user did not supply. `--config-dir` overrides `GARCON_CONFIG_DIR`, defaulting to `~/.garcon`. `--runtime` overrides `GARCON_RUNTIME`, defaulting to `auto`; explicit roles are `controller` and `execution-node`. Workspace selectors configure only the controller and are not CLI flags. `--server` asserts the selected runtime's URL; it does not redirect credentials.
+
+Automatic discovery reads `<config-dir>/runtime.json` and `<config-dir>/execution-node/runtime.json`. When both exist, it selects the newer `startedAt` (controller on a tie) and warns on stderr. A failed selection never falls back to the other role. Garcon terminals and agent processes inherit their parent's config root and explicit role. Use the resolved role in follow-up commands, especially ticket retries; switching to the controller changes the caller's authority.
 
 ## Discover Selections
 

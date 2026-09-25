@@ -33,7 +33,20 @@ User inputs:
 - `AGENT` is the agent. One of `pi`, `claude`, `codex`, or `opencode`.
 - `MODEL` is the model.
 - `PROVIDER` (optional) is the provider, only necessary for some providers or when not using defaults.
-- `WORKSPACE` (optional) is the named Garcon workspace, not a filesystem path. Omit if the user did not provide.
+- `CONFIG_DIR` (optional) is the shared Garcon config root, not a controller workspace or worker data directory.
+- `RUNTIME` (optional) is `auto`, `controller`, or `execution-node`.
+- `SERVER` (optional) asserts the selected runtime's URL; it does not redirect credentials.
+
+Build the connection arguments from supplied values and reuse them in each invocation:
+
+```bash
+GARCON_CONNECTION=()
+if [[ -n "${CONFIG_DIR:-}" ]]; then GARCON_CONNECTION+=(--config-dir "$CONFIG_DIR"); fi
+if [[ -n "${RUNTIME:-}" ]]; then GARCON_CONNECTION+=(--runtime "$RUNTIME"); fi
+if [[ -n "${SERVER:-}" ]]; then GARCON_CONNECTION+=(--server "$SERVER"); fi
+```
+
+Flags override `GARCON_CONFIG_DIR` and `GARCON_RUNTIME`; the defaults are `~/.garcon` and `auto`. Automatic selection chooses the newer runtime when both roles exist, with a warning on stderr, and never falls back after a failure. Workspace configuration belongs to the controller and is not a CLI selector. Garcon children inherit their parent's root and role. Preserve the resolved role for follow-ups rather than switching authority after a failure.
 
 For every new chat, pass `--cwd "$TARGET_DIR"` **and** put this instruction in the prompt:
 
@@ -48,15 +61,14 @@ If `pwd` returns this directory by default, do not add unnecessary `cd` commands
 ## Discover Exact Selections
 
 Use the user's inputs to query before starting a new chat.
-Omit `--workspace` if `WORKSPACE` is unset or set to `default`.
 The output can be long, so use `grep -i` to filter on values provided by the user.
 
 ```bash
-"${GARCON_CLI[@]}" --workspace "$WORKSPACE" list providers --agent "$AGENT" --json
-"${GARCON_CLI[@]}" --workspace "$WORKSPACE" list endpoints --agent "$AGENT" --provider "$PROVIDER" --json
-"${GARCON_CLI[@]}" --workspace "$WORKSPACE" list models --agent "$AGENT" --provider "$PROVIDER" --json
-"${GARCON_CLI[@]}" --workspace "$WORKSPACE" list permissions --agent "$AGENT" --json
-"${GARCON_CLI[@]}" --workspace "$WORKSPACE" list reasoning-efforts --agent "$AGENT" --json
+"${GARCON_CLI[@]}" "${GARCON_CONNECTION[@]}" list providers --agent "$AGENT" --json
+"${GARCON_CLI[@]}" "${GARCON_CONNECTION[@]}" list endpoints --agent "$AGENT" --provider "$PROVIDER" --json
+"${GARCON_CLI[@]}" "${GARCON_CONNECTION[@]}" list models --agent "$AGENT" --provider "$PROVIDER" --json
+"${GARCON_CLI[@]}" "${GARCON_CONNECTION[@]}" list permissions --agent "$AGENT" --json
+"${GARCON_CLI[@]}" "${GARCON_CONNECTION[@]}" list reasoning-efforts --agent "$AGENT" --json
 ```
 
 Discover in dependency order: agent, provider, endpoint when applicable, then model. A provider is optional when the model is unambiguous; omit its filter in that case.
@@ -92,7 +104,7 @@ Use only flags with actual values:
 
 ```bash
 "${GARCON_CLI[@]}" \
-  --workspace "$WORKSPACE" \
+  "${GARCON_CONNECTION[@]}" \
   start \
   --cwd "$TARGET_DIR" \
   --agent "$AGENT" \
@@ -119,7 +131,7 @@ Resume follow-up work on the same topic and agent instead of starting over:
 
 ```bash
 "${GARCON_CLI[@]}" \
-  --workspace "$WORKSPACE" \
+  "${GARCON_CONNECTION[@]}" \
   resume "$CHAT_ID" \
   - < "$FOLLOW_UP_PROMPT_FILE"
 ```
@@ -132,7 +144,7 @@ Use `resume-async` only when the user explicitly requests an immediate return af
 
 ```bash
 "${GARCON_CLI[@]}" \
-  --workspace "$WORKSPACE" \
+  "${GARCON_CONNECTION[@]}" \
   resume-async "$CHAT_ID" \
   - < "$FOLLOW_UP_PROMPT_FILE"
 ```

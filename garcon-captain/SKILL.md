@@ -31,7 +31,7 @@ fi
 
 If unresolved, ask for the Garcon repository path and use its first existing `cli/main` or `cli/main.ts` through `bun`. Verify `"${GARCON_CLI[@]}" --version`; report and stop if verification fails. Repeat resolution in each new shell invocation.
 
-Use the user's `--workspace`, `--config-dir`, and `--server` when supplied. Otherwise use CLI defaults. Prefer `--json` for decisions and automation; translate results into clear prose for the user.
+Use the user's `--config-dir` and `--runtime auto|controller|execution-node` when supplied. Flags override `GARCON_CONFIG_DIR` and `GARCON_RUNTIME`; otherwise the defaults are `~/.garcon` and `auto`. Workspace settings belong to the controller, not the CLI. `--server` only asserts the selected runtime's URL; it does not redirect credentials. Preserve the resolved role in follow-up commands rather than switching authority after a failure. Prefer `--json` for decisions and automation; translate results into clear prose for the user.
 
 ## Choose The Surface
 
