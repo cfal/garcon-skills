@@ -58,7 +58,19 @@ Pipe-separated values are OR alternatives. Repeated `id:`, `parent:`, `title:`, 
   -B 5 -A 5 --transcript-view-id "$VIEW_ID" --json
 ```
 
-Search is lexical. Quoted phrases are adjacent within one indexed entry. Unquoted terms are ANDed at chat scope and may occur in different entries; terms of at least three code points use prefix matching. Sort is `relevance`, `activity`, or `created`. Page limits are 1–100, offsets 0–9,999, and snippets 1–3.
+Search is lexical for ordinary words. Ordinary unquoted words of at least three code points use prefix matching; quoted word phrases require adjacent words within one indexed entry. Separate terms are ANDed at chat scope and may occur in different entries.
+
+Terms containing punctuation, such as `#731`, `ABC-123`, `file_name`, or `/workspace/src/index.ts`, match their literal spelling case-insensitively, without word-prefix expansion. Identifier word edges are exact: `#731` does not match `731` or `#7310`. Quoting an identifier keeps the same literal behavior. Quoted phrases containing punctuation preserve it too; whitespace is normalized. Prose punctuation is significant: `TypeError:` requires the colon, and straight and curly apostrophes differ.
+
+There is no wildcard syntax: `*` is literal punctuation. Plain output displays lexical prefixes as `prefix("word")`; that notation describes interpretation, not query syntax. Whitespace outside quotes separates terms, including Unicode whitespace. Use double quotes for phrases containing apostrophes; single-quoted phrases cannot contain apostrophes. An opening double quote directly after `:` stays in the same term, as in `key:"value"`; other double quotes start a separate phrase, and a closing quote ends its term. Enclose whole JSON or attribute fragments in single quotes in the query text, such as `'"type":"tool_use"'` or `'class="banner"'`, to require their literal spelling within one entry. Shell quoting alone does not add query delimiters; for example:
+
+```bash
+"${GARCON_CLI[@]}" search "'class=\"banner\"'" --json
+```
+
+Literal spelling does not fold accents or composed/decomposed Unicode forms. Matching retains the index's Unicode tokenizer and case-folding limits: some newer case pairs are not equivalent, and newer symbols or private-use glyphs attached directly after an identifier can prevent an exact candidate match. Missing results therefore do not prove absence even with complete, non-truncated index coverage. Literal matching is a query-time refinement; no index rebuild is required.
+
+Sort is `relevance`, `activity`, or `created`. Page limits are 1–100, offsets 0–9,999, and snippets 1–3.
 
 Metadata filtering happens before ranking. Do not split a filter selecting over 10,000 chats: narrow it. `page.total` is exact only when `index.resultsTruncated` is false. Follow `hasMore`/`nextOffset`, deduplicate IDs, and compare totals between pages; `created` is the least volatile long-enumeration order.
 

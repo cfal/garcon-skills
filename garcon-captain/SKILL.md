@@ -45,7 +45,7 @@ Load only the surface needed for the request.
 
 - Discover live agents, providers, models, permissions, efforts, and preamble IDs before using an uncertain value. Never silently substitute a selection.
 - Search metadata before transcripts when title, project, tag, date, state, ID, or direct parent can answer or narrow the request.
-- Search transcripts lexically. Quote phrases that must be adjacent. Treat separate terms as same-chat AND, even when they occur in different messages.
+- Search ordinary transcript words lexically. Punctuation-bearing terms such as `#731` match literally, case-insensitively, without prefix expansion; `*` is literal, not a wildcard. Quote word phrases that must be adjacent. Treat separate terms as same-chat AND, even when they occur in different messages. See [cli.md](cli.md#search-and-read-transcripts) for fragment quoting and Unicode limits.
 - Follow `page.hasMore` and `page.nextOffset`; deduplicate chat IDs across changing pages. Never infer completeness from a short page.
 - Never claim absence when coverage is pending, failed, unindexed, unsupported, stale, timed out, or truncated. State the limitation and narrow, rebuild, wait, or retry as appropriate.
 - Verify a search hit with its view-fenced `read` command before quoting it or making a consequential claim. Use snippet timestamps for when a message was written; chat activity is a different clock.
